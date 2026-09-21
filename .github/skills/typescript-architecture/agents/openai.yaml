@@ -1,0 +1,6 @@
+interface:
+  display_name: "TypeScript Architecture"
+  short_description: "Apply repository TypeScript boundaries"
+  default_prompt: "Use $typescript-architecture only as directed by this repository's explicit SDD workflow."
+policy:
+  allow_implicit_invocation: false

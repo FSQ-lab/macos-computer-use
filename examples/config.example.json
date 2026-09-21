@@ -1,0 +1,50 @@
+{
+  "image": {
+    "reference": "ghcr.io/example/macos-computer-use",
+    "digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+  },
+  "aut": {
+    "bundleId": "com.example.MacOSComputerUseFixture",
+    "window": { "title": { "exact": "Computer Use Fixture" } }
+  },
+  "timeouts": {
+    "runTotalMs": 600000,
+    "imagePullMs": 300000,
+    "cloneMs": 120000,
+    "vmBootMs": 180000,
+    "guestReadyMs": 120000,
+    "appiumStartMs": 60000,
+    "mac2SessionMs": 120000,
+    "appReadyMs": 60000,
+    "observeMs": 30000,
+    "actionMs": 30000,
+    "assertionMs": 30000,
+    "evidenceFinalizeMs": 60000,
+    "cleanupMs": 120000
+  },
+  "state": {
+    "root": "/Users/you/Library/Application Support/macos-computer-use",
+    "tempRoot": "/Users/you/Library/Caches/macos-computer-use"
+  },
+  "evidence": {
+    "root": "/Users/you/Library/Application Support/macos-computer-use/evidence",
+    "retentionDays": 7,
+    "maxArtifactBytes": 10485760,
+    "maxRunBytes": 104857600
+  },
+  "retry": {
+    "imagePull": { "maxAttempts": 2, "backoffMs": 500 },
+    "readiness": { "maxAttempts": 10, "backoffMs": 1000 },
+    "observation": { "maxAttempts": 2, "backoffMs": 250 }
+  },
+  "network": [],
+  "secrets": { "allowedNames": [] },
+  "compatibility": {
+    "tart": "2.35",
+    "appiumMajor": 3,
+    "mac2": "4.3.1",
+    "guestMacOS": "26.0",
+    "xcode": "26.0",
+    "fixtureBuild": "1"
+  }
+}

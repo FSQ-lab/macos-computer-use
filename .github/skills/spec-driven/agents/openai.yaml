@@ -1,0 +1,6 @@
+interface:
+  display_name: "Spec Driven"
+  short_description: "Run required project modification"
+  default_prompt: "Use $spec-driven with a confirmed design path or direct change request; establish SPEC authority, implement, verify, and audit."
+policy:
+  allow_implicit_invocation: false

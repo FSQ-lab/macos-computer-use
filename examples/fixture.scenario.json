@@ -1,0 +1,30 @@
+{
+  "schemaVersion": 1,
+  "name": "fixture-click",
+  "actions": [
+    {
+      "stepId": "click",
+      "target": { "identifier": "fixture.click" },
+      "action": { "kind": "click" },
+      "verification": {
+        "policy": "immediate",
+        "assertions": [
+          {
+            "kind": "text",
+            "query": { "identifier": "fixture.status" },
+            "expected": "Clicked",
+            "match": "exact"
+          }
+        ]
+      }
+    }
+  ],
+  "finalAssertions": [
+    {
+      "kind": "text",
+      "query": { "identifier": "fixture.status" },
+      "expected": "Clicked",
+      "match": "exact"
+    }
+  ]
+}

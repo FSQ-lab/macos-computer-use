@@ -1,0 +1,6 @@
+interface:
+  display_name: "Project SPEC Audit"
+  short_description: "Audit project diff against SPEC"
+  default_prompt: "Use $spec-implementation-audit to independently audit identity-verified project changes against current SPEC files."
+policy:
+  allow_implicit_invocation: false

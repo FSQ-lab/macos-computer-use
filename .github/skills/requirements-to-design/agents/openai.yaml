@@ -1,0 +1,6 @@
+interface:
+  display_name: "Requirements To Design"
+  short_description: "Clarify and confirm a project design"
+  default_prompt: "Use $requirements-to-design to clarify this change and produce a confirmed design document without implementing it."
+policy:
+  allow_implicit_invocation: false

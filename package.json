@@ -1,0 +1,47 @@
+{
+  "name": "macos-computer-use",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=24 <25"
+  },
+  "packageManager": "pnpm@11.19.0",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    },
+    "./contracts": {
+      "types": "./dist/contracts/public.d.ts",
+      "import": "./dist/contracts/public.js"
+    }
+  },
+  "bin": {
+    "macos-computer-use": "./dist/cli/main.js"
+  },
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "vitest run",
+    "lint": "eslint .",
+    "format:check": "prettier --check 'src/**/*.{ts,js,json}' 'tests/**/*.ts' '*.{js,ts,json}'",
+    "check": "tsc -p tsconfig.json --noEmit && eslint . && prettier --check 'src/**/*.{ts,js,json}' 'tests/**/*.ts' '*.{js,ts,json}' && vitest run && tsc -p tsconfig.build.json"
+  },
+  "dependencies": {
+    "fast-xml-parser": "5.3.4",
+    "zod": "4.3.6"
+  },
+  "devDependencies": {
+    "@eslint/js": "9.36.0",
+    "@types/node": "24.12.2",
+    "eslint": "9.36.0",
+    "prettier": "3.6.2",
+    "typescript": "6.0.3",
+    "typescript-eslint": "8.44.1",
+    "vitest": "4.1.5"
+  }
+}
