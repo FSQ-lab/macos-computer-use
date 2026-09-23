@@ -24,3 +24,6 @@ export type WindowId = z.infer<typeof WindowIdSchema>;
 export type ElementId = z.infer<typeof ElementIdSchema>;
 export type LeaseId = z.infer<typeof LeaseIdSchema>;
 export type OperationId = z.infer<typeof OperationIdSchema>;
+export interface IdGenerator {
+  next(prefix: string): string;
+}

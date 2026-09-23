@@ -88,10 +88,30 @@ export const ProbeResultSchema = z
     validForMs: z.number().nonnegative(),
     durationMs: z.number().nonnegative(),
     reason: z.string().optional(),
+    actual: z
+      .object({
+        guestMacOS: z.string(),
+        xcode: z.string(),
+        appium: z.string(),
+        mac2: z.string(),
+        wdaSha256: z.string().regex(/^[a-f0-9]{64}$/),
+        buildIdentity: z.string(),
+        fixtureBuild: z.string(),
+        bundleId: z.string(),
+        windowServerReady: z.boolean(),
+      })
+      .strict()
+      .optional(),
   })
   .strict();
 export const VmStatusSchema = z
   .object({ exists: z.boolean(), state: z.enum(["stopped", "running", "unknown"]) })
+  .strict();
+export const CloneResultSchema = z
+  .object({ resourceId: z.string().min(1).max(128), receipt: ProviderReceiptSchema })
+  .strict();
+export const AppiumStartResultSchema = z
+  .object({ channelId: OperationIdSchema, receipt: ProviderReceiptSchema })
   .strict();
 
 export type OperationError = z.infer<typeof OperationErrorSchema>;
@@ -101,6 +121,8 @@ export type RetryDisposition = z.infer<typeof RetryDispositionSchema>;
 export type ProviderReceipt = z.infer<typeof ProviderReceiptSchema>;
 export type ProbeResult = z.infer<typeof ProbeResultSchema>;
 export type VmStatus = z.infer<typeof VmStatusSchema>;
+export type CloneResult = z.infer<typeof CloneResultSchema>;
+export type AppiumStartResult = z.infer<typeof AppiumStartResultSchema>;
 export type OperationResult<T> = { ok: true; value: T } | { ok: false; error: OperationError };
 
 export const ok = <T>(value: T): OperationResult<T> => ({ ok: true, value });

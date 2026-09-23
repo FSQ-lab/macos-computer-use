@@ -72,7 +72,7 @@ Unknown schema, damaged ownership state, unattributed/multiple managed clones, o
 
 ## Hooks
 
-Hooks are ordered optional extensions over sanitized events. They cannot provide required Evidence, write timeline/Manifest directly, change actions/state/results, access raw diagnostics, or decide dispatch. Kernel validates and persists returned contributions. Hook timeout/failure appends `HookFailed` and does not indefinitely block cleanup. Upload Hooks are disabled unless explicitly configured.
+Hooks are ordered optional extensions over sanitized events. Configuration supplies serializable Hook module descriptors, not in-process callbacks. Each delivery executes in a fresh terminable Worker with cloned event input and AbortSignal-equivalent cancellation messaging. Workers return only strictly validated bounded contributions; they cannot provide required Evidence, write timeline/Manifest directly, change actions/state/results, access raw diagnostics, or decide dispatch. Timeout/cancellation terminates and awaits the Worker before Kernel appends `HookFailed` and continues; Hook JavaScript or handles cannot survive delivery return. Upload Hooks are disabled unless explicitly configured.
 
 ## Internal Structure
 

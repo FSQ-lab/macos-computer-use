@@ -3,3 +3,4 @@ export * from "./gateway.js";
 export * from "./environment-state.js";
 export * from "./runtime.js";
 export * from "./timeout.js";
+export * from "./hook-pipeline.js";

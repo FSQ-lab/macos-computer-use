@@ -1,18 +1,14 @@
 export interface Clock {
   wallNow(): Date;
   monotonicMs(): number;
+  schedule(callback: () => void, delayMs: number): () => void;
+  sleep(delayMs: number, signal: AbortSignal): Promise<void>;
 }
-export interface IdGenerator {
-  next(prefix: string): string;
-}
+export type { IdGenerator } from "../contracts/index.js";
 export interface Hasher {
   sha256(input: string | Uint8Array): string;
 }
 export interface SecretResolver {
   resolve(name: string): string | undefined;
 }
-export interface KernelHook {
-  readonly name: string;
-  onEvent(event: EvidenceEvent, signal: AbortSignal): Promise<readonly { type: string; bytes: Uint8Array }[]>;
-}
-import type { EvidenceEvent } from "../contracts/index.js";
+export type { EventHook as KernelHook } from "../contracts/index.js";

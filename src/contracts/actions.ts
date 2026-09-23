@@ -188,7 +188,19 @@ export const ScenarioStepSchema = z
 export const ScenarioSchema = z
   .object({
     schemaVersion: z.literal(1),
-    name: z.string().min(1).max(200),
+    name: z
+      .string()
+      .trim()
+      .min(1)
+      .max(200)
+      .refine(
+        (value) =>
+          !Array.from(value).some((character) => {
+            const code = character.charCodeAt(0);
+            return code < 32 || code === 127;
+          }),
+        "Scenario name cannot contain control characters",
+      ),
     actions: z.array(ScenarioStepSchema),
     finalAssertions: z.array(AssertionSpecSchema).min(1),
   })

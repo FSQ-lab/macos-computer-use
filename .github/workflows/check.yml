@@ -1,0 +1,48 @@
+name: deterministic-checks
+on:
+  push:
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  typescript:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+      - run: npm install --global pnpm@11.19.0
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm check
+  fixture:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - run: swift test --package-path fixtures/macos-test-app
+      - run: fixtures/macos-test-app/build-app.sh
+  provider-contracts:
+    if: ${{ vars.MCU_PROVIDER_ENABLED == 'true' }}
+    runs-on: [self-hosted, macOS, ARM64, macos-computer-use]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+      - run: npm install --global pnpm@11.19.0
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm build
+      - name: Provider lifecycle
+        env:
+          MCU_PROVIDER_CONFIG: ${{ vars.MCU_PROVIDER_CONFIG }}
+        run: pnpm exec vitest run tests/provider-lifecycle.test.ts
+      - name: Extended provider conformance
+        env:
+          MCU_PROVIDER_CONFIG: ${{ vars.MCU_PROVIDER_CONFIG }}
+          MCU_PROVIDER_PROFILE: extended
+        run: pnpm exec vitest run tests/provider-conformance.test.ts
+      - name: Failure, cancellation, and idempotent recovery
+        env:
+          MCU_PROVIDER_CONFIG: ${{ vars.MCU_PROVIDER_CONFIG }}
+          MCU_PROVIDER_PROFILE: failure
+        run: pnpm exec vitest run tests/provider-failure.test.ts

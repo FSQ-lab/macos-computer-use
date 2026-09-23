@@ -38,12 +38,13 @@ export const GatewayConfigSchema = z
           .regex(/^[a-z0-9.-]+(?::[0-9]+)?\/[a-z0-9._/-]+$/)
           .refine((value) => !value.includes("..") && !value.startsWith("http")),
         digest: z.string().regex(/^sha256:[a-f0-9]{64}$/),
+        buildIdentity: z.string().regex(/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/),
       })
       .strict(),
     aut: z
       .object({
         bundleId: z.string().regex(/^[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)+$/),
-        window: WindowQuerySchema,
+        window: z.lazy(() => WindowQuerySchema),
         arguments: z.array(z.string()).max(64).optional(),
         allowedEnvironmentSecrets: z.array(z.string()).optional(),
       })
@@ -92,9 +93,13 @@ export const GatewayConfigSchema = z
       .default({ allowedNames: [] }),
     compatibility: z
       .object({
-        tart: z.string().default("2.35"),
+        tart: z.literal("2.35").default("2.35"),
         appiumMajor: z.literal(3).default(3),
+        appium: z.literal("3.7.0").default("3.7.0"),
         mac2: z.literal("4.3.1").default("4.3.1"),
+        wdaSha256: z
+          .literal("bad71dfeaaa51d3a7224f022c580cdb7424565ca0c4b7f72ad4b0c2b9a339b62")
+          .default("bad71dfeaaa51d3a7224f022c580cdb7424565ca0c4b7f72ad4b0c2b9a339b62"),
         guestMacOS: z.string().regex(/^\d+\.\d+(?:\.\d+)?$/),
         xcode: z.string().regex(/^\d+\.\d+(?:\.\d+)?$/),
         fixtureBuild: z.string().regex(/^[0-9A-Za-z._-]+$/),
@@ -103,7 +108,9 @@ export const GatewayConfigSchema = z
       .default({
         tart: "2.35",
         appiumMajor: 3,
+        appium: "3.7.0",
         mac2: "4.3.1",
+        wdaSha256: "bad71dfeaaa51d3a7224f022c580cdb7424565ca0c4b7f72ad4b0c2b9a339b62",
         guestMacOS: "26.0",
         xcode: "26.0",
         fixtureBuild: "1",

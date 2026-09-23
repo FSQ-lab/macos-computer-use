@@ -1,10 +1,11 @@
-import { mkdir, open, readFile, rm, stat } from "node:fs/promises";
+import { access, lstat, readFile, stat } from "node:fs/promises";
 import { execFile, execFileSync } from "node:child_process";
-import { statSync } from "node:fs";
+import { constants, statSync } from "node:fs";
 import { join } from "node:path";
 import { promisify } from "node:util";
 import {
   AssertionSpecSchema,
+  HookDescriptorSchema,
   DesktopActionSchema,
   ElementIdSchema,
   ElementQuerySchema,
@@ -19,21 +20,32 @@ import {
 } from "../contracts/index.js";
 import {
   LocalEvidenceAdapter,
+  MemorySensitiveDataPolicy,
   Mac2DesktopAdapter,
   TartAdapter,
   TartExecGuestAdapter,
 } from "../adapters/index.js";
-import { Gateway, type InteractiveRun } from "../kernel/index.js";
+import { Gateway } from "../kernel/index.js";
 import { FileGatewayLock } from "./file-lock.js";
 import { EnvironmentSecretResolver, SecureIdGenerator, Sha256Hasher, SystemClock } from "./runtime.js";
+import { WorkerEventHook } from "./worker-hook.js";
 
-export type ClientRunResult = Awaited<ReturnType<Gateway["execute"]>>;
+import type { ClientRun, ClientRunResult } from "./public-types.js";
+import type {
+  HookDescriptor,
+  OperationId,
+  RunId,
+  RunManifest,
+  RunResult,
+  VisualEvaluator,
+} from "../contracts/public.js";
+export type { ClientRun, ClientRunResult } from "./public-types.js";
 
 export interface MacOSComputerUseClient {
   run<T>(
     options: { finalAssertions: readonly AssertionSpec[]; signal?: AbortSignal },
-    callback: (run: InteractiveRun) => Promise<T>,
-  ): ReturnType<Gateway["executeInteractive"]>;
+    callback: (run: ClientRun) => Promise<T>,
+  ): Promise<OperationResult<{ runId: RunId; result: RunResult; value?: T }>>;
   runScenario(scenario: unknown, options?: { signal?: AbortSignal }): Promise<ClientRunResult>;
   loadScenario(path: string): Promise<OperationResult<Scenario>>;
   doctor(options?: {
@@ -42,19 +54,39 @@ export interface MacOSComputerUseClient {
   }): Promise<
     OperationResult<{ checks: readonly { name: string; status: "passed" | "failed"; detail: string }[] }>
   >;
-  recover(): Promise<OperationResult<{ status: "clean" | "recoveryRequired" }>>;
-  listRuns(): ReturnType<LocalEvidenceAdapter["listRuns"]>;
-  showRun(runId: unknown): ReturnType<LocalEvidenceAdapter["showRun"]>;
-  exportEvidence(runId: unknown, destination: string): ReturnType<LocalEvidenceAdapter["exportRun"]>;
-  applyRetention(): ReturnType<LocalEvidenceAdapter["applyRetention"]>;
+  recover(options?: {
+    signal?: AbortSignal;
+  }): Promise<OperationResult<{ status: "clean" | "recoveryRequired" }>>;
+  listRuns(): Promise<OperationResult<readonly RunId[]>>;
+  showRun(runId: unknown): Promise<OperationResult<RunManifest>>;
+  exportEvidence(runId: unknown, destination: string): Promise<OperationResult<{ exported: true }>>;
+  applyRetention(): Promise<OperationResult<readonly RunId[]>>;
+  listRetentionFailures(): Promise<OperationResult<readonly RunId[]>>;
 }
 
-const buildMacOSComputerUseClient = (input: unknown): MacOSComputerUseClient => {
+export const buildMacOSComputerUseClientForTesting = (
+  input: unknown,
+  options?: { visualEvaluator?: VisualEvaluator; hooks?: readonly HookDescriptor[] },
+): MacOSComputerUseClient => {
   const config = GatewayConfigSchema.parse(input);
-  const tartVersion = execFileSync("tart", ["--version"], { encoding: "utf8" }).trim();
+  const hooks = (options?.hooks ?? []).map((hook) => new WorkerEventHook(HookDescriptorSchema.parse(hook)));
+  if (new Set(hooks.map((hook) => hook.name)).size !== hooks.length) throw new Error("Duplicate Hook names");
+  const tartVersion = (() => {
+    try {
+      return execFileSync("tart", ["--version"], {
+        encoding: "utf8",
+        timeout: 5000,
+        maxBuffer: 4096,
+        stdio: ["ignore", "pipe", "ignore"],
+      }).trim();
+    } catch {
+      return "unavailable";
+    }
+  })();
   const softnetReady = (() => {
     try {
-      return (statSync("/opt/homebrew/bin/softnet").mode & 0o4000) !== 0;
+      const info = statSync("/opt/homebrew/bin/softnet");
+      return info.isFile() && info.uid === 0 && (info.mode & 0o4000) !== 0;
     } catch {
       return false;
     }
@@ -62,26 +94,67 @@ const buildMacOSComputerUseClient = (input: unknown): MacOSComputerUseClient => 
   const compatibilityError =
     !process.versions.node.startsWith("24.") || process.platform !== "darwin" || process.arch !== "arm64"
       ? "Unsupported Host runtime."
-      : !tartVersion.startsWith(config.compatibility.tart)
+      : !/^2\.35\.\d+$/.test(tartVersion)
         ? "Unsupported Tart version."
         : !softnetReady
           ? "Tart Softnet is not prepared with its required SUID permission. Run Tart once and complete the operator-approved sudo setup."
           : undefined;
+  const sensitive = new MemorySensitiveDataPolicy();
+  const ids = new SecureIdGenerator();
   const appEnvironment: Record<string, string> = {};
   for (const name of config.aut.allowedEnvironmentSecrets ?? []) {
     if (!config.secrets.allowedNames.includes(name) || process.env[name] === undefined)
       throw new Error("Configured AUT environment Secret is unavailable or not allowlisted.");
     appEnvironment[name] = process.env[name];
+    sensitive.remember(process.env[name]);
   }
   const evidence = new LocalEvidenceAdapter(
     config.evidence.root,
     config.state.root,
     config.evidence.maxArtifactBytes,
     config.evidence.maxRunBytes,
+    undefined,
+    config.state.tempRoot,
   );
-  const tart = new TartAdapter();
-  const guest = new TartExecGuestAdapter();
-  const desktop = new Mac2DesktopAdapter();
+  const tart = new TartAdapter("tart", ids);
+  const driverChannels = new Map<OperationId, { endpoint: string; elementOriginActions: boolean }>();
+  const guestAdapter = new TartExecGuestAdapter(
+    "tart",
+    sensitive,
+    (channelId, channel) => driverChannels.set(channelId, channel),
+    ids,
+  );
+  const guest = {
+    probe: guestAdapter.probe.bind(guestAdapter),
+    configureNetwork: guestAdapter.configureNetwork.bind(guestAdapter),
+    startAppium: guestAdapter.startAppium.bind(guestAdapter),
+    stopAppium: async (...args: Parameters<TartExecGuestAdapter["stopAppium"]>) => {
+      const result = await guestAdapter.stopAppium(...args);
+      driverChannels.clear();
+      return result;
+    },
+    exportDiagnostics: guestAdapter.exportDiagnostics.bind(guestAdapter),
+  };
+  const desktop = new Mac2DesktopAdapter(
+    fetch,
+    options?.visualEvaluator,
+    sensitive,
+    (channelId) => driverChannels.get(channelId),
+    ids,
+  );
+  const lock = new FileGatewayLock(join(config.state.root, "gateway.lock"));
+  const runtimeLock = {
+    acquire: async () => {
+      const acquired = await lock.acquire();
+      if (!acquired.ok) return acquired;
+      const retention = await evidence.applyRetention(config.evidence.retentionDays);
+      if (!retention.ok) {
+        await acquired.value();
+        return retention;
+      }
+      return acquired;
+    },
+  };
   const gateway = new Gateway({
     image: tart,
     vm: tart,
@@ -89,11 +162,12 @@ const buildMacOSComputerUseClient = (input: unknown): MacOSComputerUseClient => 
     desktop,
     evidence,
     clock: new SystemClock(),
-    ids: new SecureIdGenerator(),
+    ids,
     hasher: new Sha256Hasher(),
-    secrets: new EnvironmentSecretResolver(),
-    lock: new FileGatewayLock(join(config.state.root, "gateway.lock")),
+    secrets: new EnvironmentSecretResolver(sensitive),
+    lock: runtimeLock,
     buildVersion: "0.1.0",
+    hooks,
   });
   return {
     run: async (options, callback) => {
@@ -120,7 +194,29 @@ const buildMacOSComputerUseClient = (input: unknown): MacOSComputerUseClient => 
           callback({
             leaseId: run.leaseId,
             observe: () => run.observe(),
+            assert: async (assertion) => {
+              const parsed = AssertionSpecSchema.safeParse(assertion);
+              return parsed.success
+                ? run.assert(parsed.data)
+                : err({
+                    code: "InvalidScenario",
+                    phase: "observe",
+                    message: "Assertion is invalid.",
+                    retryDisposition: "safe",
+                  });
+            },
             compact: () => run.compact(),
+            queryPage: (query, options) => {
+              const parsed = ElementQuerySchema.safeParse(query);
+              return parsed.success
+                ? run.queryPage(parsed.data, options)
+                : err({
+                    code: "InvalidScenario",
+                    phase: "observe",
+                    message: "Query is invalid.",
+                    retryDisposition: "safe",
+                  });
+            },
             query: (query) => {
               const parsed = ElementQuerySchema.safeParse(query);
               return parsed.success
@@ -202,7 +298,11 @@ const buildMacOSComputerUseClient = (input: unknown): MacOSComputerUseClient => 
     },
     doctor: async (options) => {
       const execFileAsync = promisify(execFile);
-      const tartVersion = await execFileAsync("tart", ["--version"])
+      const tartVersion = await execFileAsync("tart", ["--version"], {
+        timeout: 5000,
+        maxBuffer: 4096,
+        signal: options?.signal,
+      })
         .then(({ stdout }) => stdout.trim())
         .catch(() => "unavailable");
       const checks: { name: string; status: "passed" | "failed"; detail: string }[] = [
@@ -221,7 +321,7 @@ const buildMacOSComputerUseClient = (input: unknown): MacOSComputerUseClient => 
         },
         {
           name: "tart",
-          status: tartVersion.startsWith(config.compatibility.tart) ? "passed" : "failed",
+          status: /^2\.35\.\d+$/.test(tartVersion) ? "passed" : "failed",
           detail: tartVersion,
         },
         {
@@ -236,34 +336,59 @@ const buildMacOSComputerUseClient = (input: unknown): MacOSComputerUseClient => 
         ["state-root", config.state.root],
         ["evidence-root", config.evidence.root],
       ] as const) {
-        const probe = join(path, `.doctor-${String(process.pid)}`);
-        const writable = await mkdir(path, { recursive: true, mode: 0o700 })
-          .then(() => open(probe, "wx", 0o600))
-          .then(async (handle) => {
-            await handle.close();
-            await rm(probe, { force: true });
+        const writable = await lstat(path)
+          .then(async (info) => {
+            if (!info.isDirectory() || info.isSymbolicLink()) return false;
+            await access(path, constants.R_OK | constants.W_OK | constants.X_OK);
             return true;
           })
           .catch(() => false);
-        checks.push({ name, status: writable ? "passed" : "failed", detail: path });
+        checks.push({
+          name,
+          status: writable ? "passed" : "failed",
+          detail: writable ? "Directory is accessible." : "Directory is missing or inaccessible.",
+        });
       }
-      const managed = await tart.listManaged(options?.signal ?? new AbortController().signal);
+      const lockChecks = await Promise.all(
+        [join(config.state.root, "gateway.lock"), FileGatewayLock.userLockPath()].map((path) =>
+          lstat(path)
+            .then(() => false)
+            .catch(
+              (error: unknown) =>
+                typeof error === "object" && error !== null && "code" in error && error.code === "ENOENT",
+            ),
+        ),
+      );
+      const lockAvailable = lockChecks.every(Boolean);
+      checks.push({
+        name: "gateway-lock",
+        status: lockAvailable ? "passed" : "failed",
+        detail: lockAvailable
+          ? "No lock record exists."
+          : "Lock record exists or is inaccessible; recovery may be required.",
+      });
+      const doctorSignal = AbortSignal.any([
+        options?.signal ?? new AbortController().signal,
+        AbortSignal.timeout(5000),
+      ]);
+      const managed = await tart.listManaged(doctorSignal);
       checks.push({
         name: "managed-resources",
         status: managed.ok && managed.value.length === 0 ? "passed" : "failed",
         detail: managed.ok ? `${String(managed.value.length)} managed clone(s)` : managed.error.code,
       });
-      const imageReady = await tart.checkImage(
-        config.image.reference,
-        config.image.digest,
-        options?.signal ?? new AbortController().signal,
-      );
+      const imageReady = await tart.checkImage(config.image.reference, config.image.digest, doctorSignal);
       checks.push({
         name: "golden-image",
-        status: imageReady ? "passed" : "failed",
-        detail: imageReady ? "Configured OCI digest is cached." : "Configured OCI digest is unavailable.",
+        status: imageReady.ok && imageReady.value ? "passed" : "failed",
+        detail:
+          imageReady.ok && imageReady.value
+            ? "Configured OCI digest is cached."
+            : imageReady.ok
+              ? "Configured OCI digest is unavailable."
+              : imageReady.error.code,
       });
-      if (options?.deep) {
+      if (options?.deep && checks.every((check) => check.status === "passed")) {
         const scenario = ScenarioSchema.parse({
           schemaVersion: 1,
           name: "deep-doctor",
@@ -281,7 +406,8 @@ const buildMacOSComputerUseClient = (input: unknown): MacOSComputerUseClient => 
           status:
             result.ok &&
             result.value.result.verdict === "passed" &&
-            result.value.result.cleanup === "completed"
+            result.value.result.cleanup === "completed" &&
+            result.value.result.evidence === "complete"
               ? "passed"
               : "failed",
           detail: result.ok ? JSON.stringify(result.value.result) : result.error.code,
@@ -289,9 +415,16 @@ const buildMacOSComputerUseClient = (input: unknown): MacOSComputerUseClient => 
       }
       return ok({ checks });
     },
-    recover: async () => {
-      const result = await gateway.recover(new AbortController().signal, config.timeouts.cleanupMs);
-      return result.ok ? ok({ status: "clean" }) : ok({ status: "recoveryRequired" });
+    recover: async (options) => {
+      const result = await gateway.recover(
+        options?.signal ?? new AbortController().signal,
+        config.timeouts.cleanupMs,
+        {
+          maxFileBytes: config.evidence.maxArtifactBytes,
+          maxTotalBytes: config.evidence.maxArtifactBytes,
+        },
+      );
+      return result.ok ? ok({ status: "clean" }) : result;
     },
     listRuns: () => evidence.listRuns(),
     showRun: async (runId) => {
@@ -308,7 +441,9 @@ const buildMacOSComputerUseClient = (input: unknown): MacOSComputerUseClient => 
     exportEvidence: async (runId, destination) => {
       const parsed = RunIdSchema.safeParse(runId);
       return parsed.success
-        ? evidence.exportRun(parsed.data, destination)
+        ? evidence
+            .exportRun(parsed.data, destination)
+            .then((result) => (result.ok ? ok({ exported: true as const }) : result))
         : err({
             code: "InvalidConfiguration",
             phase: "evidence",
@@ -316,13 +451,25 @@ const buildMacOSComputerUseClient = (input: unknown): MacOSComputerUseClient => 
             retryDisposition: "notApplicable",
           });
     },
-    applyRetention: () => evidence.applyRetention(config.evidence.retentionDays),
+    applyRetention: async () => {
+      const acquired = await lock.acquire();
+      if (!acquired.ok) return acquired;
+      try {
+        return await evidence.applyRetention(config.evidence.retentionDays);
+      } finally {
+        await acquired.value();
+      }
+    },
+    listRetentionFailures: () => evidence.listRetentionFailures(),
   };
 };
 
-export const createMacOSComputerUseClient = (input: unknown): OperationResult<MacOSComputerUseClient> => {
+export const createMacOSComputerUseClient = (
+  input: unknown,
+  options?: { visualEvaluator?: VisualEvaluator; hooks?: readonly HookDescriptor[] },
+): OperationResult<MacOSComputerUseClient> => {
   try {
-    return ok(buildMacOSComputerUseClient(input));
+    return ok(buildMacOSComputerUseClientForTesting(input, options));
   } catch {
     return err({
       code: "InvalidConfiguration",

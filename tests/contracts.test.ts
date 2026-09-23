@@ -3,6 +3,8 @@ import {
   ActionResultSchema,
   DesktopActionSchema,
   ElementQuerySchema,
+  EvidenceEventSchema,
+  CurrentEvidenceEventSchema,
   GatewayConfigSchema,
   RelativePointSchema,
   ScenarioSchema,
@@ -20,6 +22,30 @@ const ref = {
 };
 
 describe("contracts", () => {
+  it("requires typed action and operation identities in durable action facts", () => {
+    const base = {
+      schemaVersion: 1 as const,
+      runId: "run-00000001",
+      sequence: 1,
+      recordedAt: "2026-09-21T00:00:00.000Z",
+      elapsedMs: 0,
+      source: "kernel" as const,
+    };
+    expect(
+      EvidenceEventSchema.safeParse({
+        ...base,
+        type: "ActionPlanned",
+        data: { actionId: "action-00000001", operationId: "operation-00000001", kind: "click" },
+      }).success,
+    ).toBe(true);
+    expect(
+      CurrentEvidenceEventSchema.safeParse({
+        ...base,
+        type: "ActionPlanned",
+        data: { operationId: "operation-00000001", kind: "click" },
+      }).success,
+    ).toBe(false);
+  });
   it("models provider facts independently", () => {
     expect(
       ActionResultSchema.parse({
@@ -87,7 +113,11 @@ describe("contracts", () => {
 
   it("rejects unsafe network and inconsistent evidence limits", () => {
     const base = {
-      image: { reference: "ghcr.io/example/image", digest: `sha256:${"a".repeat(64)}` },
+      image: {
+        buildIdentity: "fixture-build-1",
+        reference: "ghcr.io/example/image",
+        digest: `sha256:${"a".repeat(64)}`,
+      },
       aut: { bundleId: "com.example.TestApp", window: { isMain: true } },
       timeouts: {
         runTotalMs: 100_000,
@@ -116,13 +146,22 @@ describe("contracts", () => {
       compatibility: {
         tart: "2.35",
         appiumMajor: 3,
+        appium: "3.7.0",
         mac2: "4.3.1",
+        wdaSha256: "bad71dfeaaa51d3a7224f022c580cdb7424565ca0c4b7f72ad4b0c2b9a339b62",
         guestMacOS: "26.0",
         xcode: "26.0",
         fixtureBuild: "1",
       },
     };
     expect(GatewayConfigSchema.parse(base)).toBeTruthy();
+    expect(
+      GatewayConfigSchema.safeParse({ ...base, image: { ...base.image, buildIdentity: undefined } }).success,
+    ).toBe(false);
+    expect(
+      GatewayConfigSchema.safeParse({ ...base, image: { ...base.image, buildIdentity: base.image.digest } })
+        .success,
+    ).toBe(false);
     expect(() =>
       GatewayConfigSchema.parse({ ...base, network: [{ cidr: "0.0.0.0/0", ports: [443], protocol: "tcp" }] }),
     ).toThrow();

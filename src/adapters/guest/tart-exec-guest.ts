@@ -1,23 +1,27 @@
+import { z } from "zod";
 import { createHash } from "node:crypto";
 import {
   err,
   ok,
   type GuestPort,
+  type SensitiveDataPolicy,
   type OperationId,
   type OperationResult,
   type ProbeResult,
   type ProviderReceipt,
+  RunIdSchema,
   ProbeResultSchema,
   ProviderReceiptSchema,
+  CompatibilityProbeSchema,
+  type IdGenerator,
+  AppiumStartResultSchema,
 } from "../../contracts/index.js";
-import { runProcess } from "../process-runner.js";
+import { runProcess } from "./process-runner.js";
 
-const op = (label: string): OperationId =>
-  `operation-${createHash("sha256").update(label).digest("hex").slice(0, 24)}` as OperationId;
-const receipt = (label: string, startedAt: string): ProviderReceipt =>
+const receipt = (operationId: OperationId, startedAt: string): ProviderReceipt =>
   ProviderReceiptSchema.parse({
     provider: "tart-exec",
-    operationId: op(`${label}-${startedAt}`),
+    operationId,
     dispatch: "dispatched",
     outcome: "succeeded",
     startedAt,
@@ -25,15 +29,33 @@ const receipt = (label: string, startedAt: string): ProviderReceipt =>
   });
 
 export class TartExecGuestAdapter implements GuestPort {
-  constructor(private readonly tart = "tart") {}
+  #elementOriginActions = false;
+  constructor(
+    private readonly tart = "tart",
+    private readonly sensitive?: SensitiveDataPolicy,
+    private readonly registerChannel?: (
+      channelId: OperationId,
+      channel: { endpoint: string; elementOriginActions: boolean },
+    ) => void,
+    private readonly ids: IdGenerator = {
+      next: () => {
+        throw new Error("Guest logical ID generator is unavailable.");
+      },
+    },
+  ) {}
+  #nativeName(resourceId: string): string {
+    return `mcu-${RunIdSchema.parse(resourceId)}`;
+  }
   async probe(
     cloneName: string,
     expected: {
-      imageDigest: string;
+      buildIdentity: string;
       bundleId: string;
       compatibility: {
         appiumMajor: 3;
+        appium: string;
         mac2: string;
+        wdaSha256: string;
         guestMacOS: string;
         xcode: string;
         fixtureBuild: string;
@@ -41,6 +63,7 @@ export class TartExecGuestAdapter implements GuestPort {
     },
     signal: AbortSignal,
   ): Promise<OperationResult<ProbeResult>> {
+    expected = CompatibilityProbeSchema.parse(expected);
     const start = performance.now();
     const observedAt = new Date().toISOString();
     const fixedCommands: readonly [string, readonly string[]][] = [
@@ -48,14 +71,35 @@ export class TartExecGuestAdapter implements GuestPort {
       ["xcode", ["/usr/bin/xcodebuild", "-version"]],
       ["appium", ["/usr/bin/env", "appium", "--version"]],
       ["drivers", ["/usr/bin/env", "appium", "driver", "list", "--installed", "--json"]],
+      [
+        "wda",
+        [
+          "/bin/zsh",
+          "-lc",
+          "driver=/Users/admin/mcu-provisioning/toolchain/node_modules/appium-mac2-driver; test -d $driver/WebDriverAgentMac; find $driver/WebDriverAgentMac -type f -print0 | sort -z | xargs -0 shasum -a 256 | shasum -a 256 | awk '{print $1}'",
+        ],
+      ],
       ["digest", ["/bin/cat", "/etc/macos-computer-use/image-digest"]],
       ["fixture", ["/bin/cat", "/etc/macos-computer-use/fixture-metadata.json"]],
       ["windowserver", ["/usr/bin/pgrep", "-x", "WindowServer"]],
     ];
     const outputs = new Map<string, string>();
     let failed = false;
+    let actual:
+      | {
+          guestMacOS: string;
+          xcode: string;
+          appium: string;
+          mac2: string;
+          wdaSha256: string;
+          buildIdentity: string;
+          fixtureBuild: string;
+          bundleId: string;
+          windowServerReady: boolean;
+        }
+      | undefined;
     for (const [name, command] of fixedCommands) {
-      const result = await runProcess(this.tart, ["exec", cloneName, ...command], signal);
+      const result = await runProcess(this.tart, ["exec", this.#nativeName(cloneName), ...command], signal);
       if (result.code !== 0) {
         failed = true;
         break;
@@ -65,28 +109,49 @@ export class TartExecGuestAdapter implements GuestPort {
     let metadataValid = false;
     try {
       const fixture: unknown = JSON.parse(outputs.get("fixture") ?? "");
-      const record =
-        typeof fixture === "object" && fixture !== null ? (fixture as Record<string, unknown>) : {};
+      const record = z
+        .object({ bundleId: z.string(), version: z.string().optional(), build: z.string() })
+        .strict()
+        .parse(fixture);
       const drivers: unknown = JSON.parse(outputs.get("drivers") ?? "");
-      const driverText = JSON.stringify(drivers);
+      const driverMetadata = z
+        .object({ mac2: z.object({ version: z.literal("4.3.1") }).loose() })
+        .loose()
+        .parse(drivers);
+      actual = {
+        guestMacOS: outputs.get("macos") ?? "",
+        xcode: (outputs.get("xcode") ?? "").split("\n")[0]?.replace(/^Xcode /, "") ?? "",
+        appium: outputs.get("appium") ?? "",
+        mac2: driverMetadata.mac2.version,
+        wdaSha256: outputs.get("wda") ?? "",
+        buildIdentity: outputs.get("digest") ?? "",
+        fixtureBuild: record.build,
+        bundleId: record.bundleId,
+        windowServerReady: (outputs.get("windowserver") ?? "").length > 0,
+      };
       metadataValid =
-        outputs.get("macos") === expected.compatibility.guestMacOS &&
-        (outputs.get("xcode") ?? "").split("\n")[0] === `Xcode ${expected.compatibility.xcode}` &&
-        (outputs.get("appium") ?? "").split(".")[0] === String(expected.compatibility.appiumMajor) &&
-        driverText.includes(`"mac2"`) &&
-        driverText.includes(expected.compatibility.mac2) &&
-        outputs.get("digest") === expected.imageDigest &&
-        record.bundleId === expected.bundleId &&
-        record.build === expected.compatibility.fixtureBuild;
+        actual.guestMacOS === expected.compatibility.guestMacOS &&
+        actual.xcode === expected.compatibility.xcode &&
+        actual.appium.split(".")[0] === String(expected.compatibility.appiumMajor) &&
+        actual.appium === expected.compatibility.appium &&
+        actual.mac2 === expected.compatibility.mac2 &&
+        actual.wdaSha256 === expected.compatibility.wdaSha256 &&
+        actual.buildIdentity === expected.buildIdentity &&
+        actual.bundleId === expected.bundleId &&
+        actual.fixtureBuild === expected.compatibility.fixtureBuild &&
+        actual.windowServerReady;
+      this.#elementOriginActions = metadataValid && actual.mac2 === "4.3.1";
     } catch {
       metadataValid = false;
+      this.#elementOriginActions = false;
     }
     return ok(
       ProbeResultSchema.parse({
         status: !failed && metadataValid ? "ready" : signal.aborted ? "notReady" : "failed",
         observedAt,
-        validForMs: 5_000,
+        validForMs: 120_000,
         durationMs: performance.now() - start,
+        ...(actual ? { actual } : {}),
         ...(!failed && metadataValid ? {} : { reason: "Guest compatibility probe failed." }),
       }),
     );
@@ -97,7 +162,7 @@ export class TartExecGuestAdapter implements GuestPort {
     signal: AbortSignal,
   ): Promise<OperationResult<ProviderReceipt>> {
     const startedAt = new Date().toISOString();
-    if (rules.length === 0) return ok(receipt("network-host-only", startedAt));
+    if (rules.length === 0) return ok(receipt(this.ids.next("operation") as OperationId, startedAt));
     const allowRules = rules.flatMap((rule) =>
       rule.ports.map(
         (port) => `pass out quick proto ${rule.protocol} to ${rule.cidr} port ${String(port)} keep state`,
@@ -105,13 +170,18 @@ export class TartExecGuestAdapter implements GuestPort {
     );
     const pfRules = [
       "set skip on lo0",
-      "pass out quick proto tcp from any port 4723 keep state",
+      "pass out quick proto udp from any port 68 to any port 67 keep state",
+      "pass in quick proto tcp to any port 4723 keep state",
       ...allowRules,
       "block drop out quick all",
     ].join("\n");
-    const encodedRules = Buffer.from(pfRules).toString("base64");
-    const command = `printf %s ${encodedRules} | base64 -D | sudo pfctl -a macos-computer-use -f - && sudo pfctl -E`;
-    const result = await runProcess(this.tart, ["exec", cloneName, "/bin/zsh", "-lc", command], signal);
+    const encodedRules = Buffer.from(pfRules + String.fromCharCode(10)).toString("base64");
+    const command = `set -e; umask 077; root=/tmp/macos-computer-use/${cloneName}; mkdir -p $root; printf %s ${encodedRules} | base64 -D > $root/network.pf; sudo -n /sbin/pfctl -nf $root/network.pf; sudo -n /sbin/pfctl -f $root/network.pf; sudo -n /sbin/pfctl -E; sudo -n /sbin/pfctl -s info | grep -q "Status: Enabled"; sudo -n /sbin/pfctl -sr | grep -q "block drop out quick all"`;
+    const result = await runProcess(
+      this.tart,
+      ["exec", this.#nativeName(cloneName), "/bin/zsh", "-lc", command],
+      signal,
+    );
     if (result.code !== 0)
       return err({
         code: "ProviderFailure",
@@ -119,22 +189,22 @@ export class TartExecGuestAdapter implements GuestPort {
         message: "Guest network policy could not be applied.",
         retryDisposition: "notApplicable",
       });
-    return ok(receipt("network-policy", startedAt));
+    return ok(receipt(this.ids.next("operation") as OperationId, startedAt));
   }
   async startAppium(
     cloneName: string,
     signal: AbortSignal,
-  ): Promise<OperationResult<{ endpoint: string; receipt: ProviderReceipt }>> {
+  ): Promise<OperationResult<{ channelId: OperationId; receipt: ProviderReceipt }>> {
     const startedAt = new Date().toISOString();
     const guestRoot = `/tmp/macos-computer-use/${cloneName}`;
     const result = await runProcess(
       this.tart,
       [
         "exec",
-        cloneName,
+        this.#nativeName(cloneName),
         "/bin/zsh",
         "-lc",
-        `mkdir -p ${guestRoot} && nohup appium --address 0.0.0.0 --port 4723 > ${guestRoot}/appium.log 2>&1 &`,
+        `set -e; umask 077; mkdir -p ${guestRoot}; if [ -f ${guestRoot}/appium.pid ]; then pid=$(cat ${guestRoot}/appium.pid); case $pid in (""|*[!0-9]*) exit 22;; esac; if kill -0 $pid 2>/dev/null; then exit 0; fi; fi; printf '%s\n' 'Raw driver logging disabled to protect SecretRef values.' > ${guestRoot}/appium.log; printf '%s\n' 'No standalone WDA log is emitted by the Mac2 provider.' > ${guestRoot}/wda.log; /usr/bin/sw_vers > ${guestRoot}/guest.log; (ulimit -f 20480; exec nohup appium --address 0.0.0.0 --port 4723 --log-no-colors --log-level error) > /dev/null 2>&1 < /dev/null & echo $! > ${guestRoot}/appium.pid`,
       ],
       signal,
     );
@@ -146,7 +216,11 @@ export class TartExecGuestAdapter implements GuestPort {
         retryDisposition: "safe",
         dispatch: "notDispatched",
       });
-    const ip = await runProcess(this.tart, ["ip", cloneName, "--resolver", "agent", "--wait", "30"], signal);
+    const ip = await runProcess(
+      this.tart,
+      ["ip", this.#nativeName(cloneName), "--resolver", "agent", "--wait", "30"],
+      signal,
+    );
     const address = ip.stdout.trim();
     if (ip.code !== 0 || !/^[0-9a-f:.]+$/i.test(address))
       return err({
@@ -155,16 +229,47 @@ export class TartExecGuestAdapter implements GuestPort {
         message: "Guest control address is unavailable.",
         retryDisposition: "safe",
       });
-    return ok({ endpoint: `http://${address}:4723`, receipt: receipt("appium-start", startedAt) });
+    const endpoint = `http://${address.includes(":") ? `[${address}]` : address}:4723`;
+    try {
+      const response = await fetch(`${endpoint}/status`, { signal });
+      const status: unknown = await response.json();
+      if (
+        !response.ok ||
+        !z
+          .object({ value: z.object({ ready: z.literal(true) }).loose() })
+          .loose()
+          .safeParse(status).success
+      )
+        throw new Error("not ready");
+    } catch {
+      return err({
+        code: "SessionUnavailable",
+        phase: "guest",
+        message: "Guest Appium readiness has not passed.",
+        retryDisposition: "safe",
+      });
+    }
+    const started = receipt(this.ids.next("operation") as OperationId, startedAt);
+    this.registerChannel?.(started.operationId, {
+      endpoint,
+      elementOriginActions: this.#elementOriginActions,
+    });
+    return ok(AppiumStartResultSchema.parse({ channelId: started.operationId, receipt: started }));
   }
   async stopAppium(cloneName: string, signal: AbortSignal): Promise<OperationResult<ProviderReceipt>> {
     const startedAt = new Date().toISOString();
     const result = await runProcess(
       this.tart,
-      ["exec", cloneName, "/usr/bin/pkill", "-f", "appium.*4723"],
+      [
+        "exec",
+        this.#nativeName(cloneName),
+        "/bin/zsh",
+        "-lc",
+        `set -e; root=/tmp/macos-computer-use/${cloneName}; [ -e $root/appium.pid ] || exit 0; [ -f $root/appium.pid ] && [ ! -L $root/appium.pid ] || exit 22; pid=$(cat $root/appium.pid); case $pid in (""|*[!0-9]*) exit 22;; esac; command=$(/bin/ps -p $pid -o command=) || exit 0; case $command in (*appium*--port*4723*) kill -TERM $pid;; (*) exit 23;; esac; for attempt in 1 2 3 4 5; do kill -0 $pid 2>/dev/null || exit 0; /bin/sleep 1; done; exit 24`,
+      ],
       signal,
     );
-    if (result.code === 0 || result.code === 1) return ok(receipt("appium-stop", startedAt));
+    if (result.code === 0) return ok(receipt(this.ids.next("operation") as OperationId, startedAt));
     return err({
       code: "CleanupFailed",
       phase: "cleanup",
@@ -172,15 +277,19 @@ export class TartExecGuestAdapter implements GuestPort {
       retryDisposition: "safe",
     });
   }
-  async exportDiagnostics(cloneName: string, signal: AbortSignal): Promise<OperationResult<Uint8Array>> {
+  async exportDiagnostics(
+    cloneName: string,
+    limits: { maxFileBytes: number; maxTotalBytes: number },
+    signal: AbortSignal,
+  ): Promise<OperationResult<Uint8Array>> {
     const root = `/tmp/macos-computer-use/${cloneName}`;
     const records: { path: string; data: string; sha256: string; size: number }[] = [];
     let totalBytes = 0;
     for (const name of ["appium.log", "wda.log", "guest.log"]) {
-      const command = `if [ -f ${root}/${name} ] && [ ! -L ${root}/${name} ]; then size=$(stat -f %z ${root}/${name}); [ $size -le 10485760 ] || exit 21; base64 < ${root}/${name} | tr -d '\n'; fi`;
+      const command = `set -e; zmodload zsh/system; [ ! -L /tmp/macos-computer-use ] && [ ! -L ${root} ] || exit 22; [ -e ${root}/${name} ] || exit 25; sysopen -r -o nofollow -u diagnostic_fd -- ${root}/${name} || exit 22; metadata=$(stat -f '%HT %z' /dev/fd/$diagnostic_fd) || exit 22; type=\${metadata% *}; size=\${metadata##* }; [ "$type" = "Regular File" ] || exit 22; [ $size -le ${String(limits.maxFileBytes)} ] || exit 21; base64 <&$diagnostic_fd | tr -d '\n'`;
       const result = await runProcess(
         this.tart,
-        ["exec", cloneName, "/bin/zsh", "-lc", command],
+        ["exec", this.#nativeName(cloneName), "/bin/zsh", "-lc", command],
         signal,
         14_000_000,
       );
@@ -194,8 +303,15 @@ export class TartExecGuestAdapter implements GuestPort {
       const data = result.stdout.trim();
       if (data) {
         const bytes = Buffer.from(data, "base64");
+        if (bytes.byteLength > limits.maxFileBytes || bytes.toString("base64") !== data)
+          return err({
+            code: "EvidenceIncomplete",
+            phase: "evidence",
+            message: "Guest diagnostic encoding or size is invalid.",
+            retryDisposition: "notApplicable",
+          });
         totalBytes += bytes.byteLength;
-        if (totalBytes > 20 * 1024 * 1024)
+        if (totalBytes > limits.maxTotalBytes)
           return err({
             code: "EvidenceIncomplete",
             phase: "evidence",
@@ -213,7 +329,7 @@ export class TartExecGuestAdapter implements GuestPort {
             retryDisposition: "notApplicable",
           });
         }
-        const sanitized = decoded.replace(
+        const sanitized = (this.sensitive?.sanitizeText(decoded) ?? decoded).replace(
           /((?:token|api[_-]?key|authorization|cookie|secret|password)\s*[:=]\s*)[^\s]+/gi,
           "$1[REDACTED]",
         );

@@ -4,3 +4,5 @@ export * from "./evidence.js";
 export * from "./ids.js";
 export * from "./observation.js";
 export * from "./results.js";
+export * from "./visual.js";
+export * from "./hooks.js";

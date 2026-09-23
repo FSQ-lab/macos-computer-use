@@ -98,14 +98,17 @@ Appium, Mac2, WebDriverAgentMac, and AUT run inside the Guest. `tart exec` manag
 
 ## Supported Runtime Baseline
 
-- Host: Apple Silicon macOS. The initial conformance host baseline is macOS 26.7 arm64.
+- Host: Apple Silicon macOS. The initial conformance host baseline includes macOS 26.6.2 arm64. Acceptance requires complete provider/destructive conformance on that version; no macOS 26.7 conformance is implied.
 - Node.js: 24 LTS.
 - Tart: 2.35.x, with 2.35.0 as the initial conformance version.
 - Appium: major version 3, running in Guest.
 - Mac2 Driver: 4.3.1.
-- Guest macOS, Xcode, WDA Mac, Appium patch version, Fixture build, and permissions are fixed by an immutable Golden Image OCI digest plus validated image compatibility metadata.
+- Guest macOS, Xcode, WDA Mac, Appium patch version, Fixture build, and permissions are fixed by an immutable Golden Image OCI digest plus validated image compatibility metadata. Host/runtime versions, the configured immutable digest, and Tart's exact-digest cache identity are validated before Run allocation. Guest, Appium, Mac2, WDA, desktop-session, AUT, and permission readiness are live-probed only on the fresh disposable clone, after allocation and before any business action.
+- The final OCI digest is verified on the Host and is not embedded into the image itself. Guest metadata carries an independent build identity and compatibility information, validated against Host expectations bound to that OCI digest. The required `/etc/macos-computer-use/image-digest` file records this independent build identity, not the final OCI manifest digest; `/etc/macos-computer-use/fixture-metadata.json` records Fixture identity.
 
-The composition root fails before Run allocation when required versions or the configured image digest are absent, outside the supported matrix, or inconsistent with live probes. A version change that alters this baseline requires a confirmed SPEC update and provider/destructive conformance evidence.
+The composition root fails before Run allocation when Host-side requirements or the configured image digest are absent or outside the supported matrix. Clone-local live incompatibility fails before business work and proceeds directly to bounded Evidence finalization and cleanup. A version change that alters this baseline requires a confirmed SPEC update and provider/destructive conformance evidence.
+
+For Tart 2.35.x, Host OCI integrity authority is the registry's immutable digest verification during pull plus Tart's exact `reference@sha256` cache identity. Tart does not expose cached image bytes or a cache-quarantine API to this runtime. The runtime therefore fails closed on missing, malformed, or inconsistent inventory/pull facts, never represents name-only evidence as an independent byte rehash, and never automatically deletes, mutates, or re-pulls an existing Golden Image cache. Stronger byte re-verification or quarantine becomes supported only when a provider exposes a verifiable byte/export API.
 
 ## Repository Boundaries
 
@@ -122,13 +125,18 @@ The composition root fails before Run allocation when required versions or the c
 - No public or internal action contract accepts absolute display or window coordinates. Element-relative normalized points are converted only inside Mac2 Adapter and never fall back to absolute coordinates.
 - Each window's latest canonical Observation is the only source of actionable ElementRefs. An Action invalidates ElementRefs for affected windows.
 - Core Evidence is mandatory, write-ahead, append-only, and Kernel-coordinated. Hook failure cannot change business facts.
+- Hooks execute in terminable Worker isolation from serializable module descriptors. The in-process runtime never invokes caller Hook functions. Timeout/cancellation terminates the Worker before cleanup continues; late Hook JavaScript, timers, handles, or repository authority cannot survive Worker termination.
 - Required Evidence failure marks Evidence incomplete but never prevents bounded cleanup indefinitely. Cleanup failure never overwrites an established business verdict.
 - Unknown dispatch or Provider outcome is never guessed and is never blindly retried.
 - Golden Images are immutable; every formal Run uses a new managed clone and never modifies the shared image.
 - The runtime never deletes a Tart VM without trustworthy project-owned Run attribution.
-- Secret plaintext is memory-only and never enters configuration snapshots, logs, events, receipts, errors, or artifacts.
+- Secret values are resolved in memory and excluded from configuration snapshots, structured UI snapshots, logs, events, receipts, errors, and other non-image artifacts. Window screenshots are an explicit exception: v1 captures and stores them normally, marks them potentiallySensitive, and does not mask or inspect visible secret text.
 - Recovery finalizes Evidence and resources; it never resumes pre-crash business actions.
 
 ## Verification Obligations
 
 Deterministic CI covers type checking, lint, formatting policy, unit tests, semantic Port contracts, package exports, and build. Provisioned macOS jobs cover real Tart/Mac2 provider conformance and destructive lifecycle. The destructive acceptance path uses a fixed image digest and Fixture AUT to exercise clone, readiness, compact/structured Observation, element-relative actions, independent assertions, Evidence finalization, and clone destruction. Missing required environment evidence is reported as skipped or blocking according to the invoked profile; it is never treated as passing.
+
+## Host-only Network Rules
+
+V1 NetworkRules constrain only destinations reachable inside the Host-only network. They do not provide Internet access or enable NAT, bridging, public forwarding, or Host-mediated egress. Nonempty rules preserve Tart Host-only mode and constrain Guest traffic by CIDR, port and protocol; the control channel and DHCP remain available. Effective filtering must be verified before business work. Rules never cause automatic network relaxation.

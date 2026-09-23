@@ -19,3 +19,19 @@ enum FixtureContract {
     "fixture.reset",
   ]
 }
+
+struct FixtureState: Equatable {
+  var status = "Ready"
+  var text = ""
+  var checked = false
+  var hover = false
+  var dropped = false
+  var showModal = false
+  var hiddenVisible = true
+  var scrollGeneration = 0
+  var scrollOffset = 0
+
+  mutating func reset() {
+    self = FixtureState(scrollGeneration: scrollGeneration + 1)
+  }
+}

@@ -2,6 +2,13 @@ import { createHash } from "node:crypto";
 import { XMLParser } from "fast-xml-parser";
 import {
   ElementSummarySchema,
+  QueryPageSchema,
+  type QueryPage,
+  AssertionSpecSchema,
+  VisualEvaluationSchema,
+  VisualModelSchema,
+  type VisualEvaluator,
+  type SensitiveDataPolicy,
   DesktopActionSchema,
   err,
   ok,
@@ -20,21 +27,33 @@ import {
   type SessionRequest,
   type TextMatch,
   type WindowQuery,
+  SessionRequestSchema,
+  ObserveRequestSchema,
+  type IdGenerator,
 } from "../../contracts/index.js";
 
 type JsonObject = Record<string, unknown>;
+class WebDriverFailure extends Error {
+  constructor(readonly providerCode: string) {
+    super(`webdriver:${providerCode}`);
+  }
+}
 type NativeLocator = {
   identifier?: string;
   role: string;
   name?: string;
+  title?: string;
   label?: string;
   value?: string;
+  enabled?: boolean;
+  selected?: boolean;
+  focused?: boolean;
+  visible?: boolean;
+  query?: ElementQuery;
   width?: number;
   height?: number;
 };
 const W3C_ELEMENT = "element-6066-11e4-a52e-4f735466cecf";
-const hashId = (prefix: string, value: string): string =>
-  `${prefix}-${createHash("sha256").update(value).digest("hex").slice(0, 24)}`;
 const asObject = (value: unknown): JsonObject | undefined =>
   typeof value === "object" && value !== null && !Array.isArray(value) ? (value as JsonObject) : undefined;
 const xpathLiteral = (value: string): string =>
@@ -48,13 +67,37 @@ const xpathLiteral = (value: string): string =>
           .join(`, "'", `)})`;
 
 export class Mac2DesktopAdapter implements DesktopPort {
-  constructor(private readonly fetcher: typeof fetch = fetch) {}
+  constructor(
+    private readonly fetcher: typeof fetch = fetch,
+    private readonly visualEvaluator?: VisualEvaluator,
+    private readonly sensitive?: SensitiveDataPolicy,
+    private readonly resolveChannel: (
+      channelId: OperationId,
+    ) => { endpoint: string; elementOriginActions: boolean } | undefined = () => undefined,
+    private readonly ids: IdGenerator = {
+      next: () => {
+        throw new Error("Mac2 logical ID generator is unavailable.");
+      },
+    },
+  ) {
+    if (visualEvaluator) {
+      VisualModelSchema.parse(visualEvaluator.model);
+      if (typeof visualEvaluator.evaluate !== "function") throw new Error("Invalid visual evaluator");
+      this.visualEvaluator = Object.freeze({
+        model: visualEvaluator.model,
+        evaluate: visualEvaluator.evaluate.bind(visualEvaluator),
+      });
+    }
+  }
+  #visualScreenshot: { observationId: string; bytes: Uint8Array } | undefined;
   #endpoint: string | undefined;
   #nativeSessionId: string | undefined;
+  #bundleId: string | undefined;
   #locators = new Map<string, NativeLocator>();
   #previousLocators = new Map<string, NativeLocator>();
   #allElements: ElementSummary[] = [];
   #windowQuery: WindowQuery | undefined;
+  #elementOriginActionsSupported = false;
   #context:
     | Pick<Observation, "runId" | "generation" | "sessionId" | "windowId" | "observationId">
     | undefined;
@@ -65,7 +108,11 @@ export class Mac2DesktopAdapter implements DesktopPort {
   ): Promise<OperationResult<ProviderReceipt>> {
     const startedAt = new Date().toISOString();
     try {
-      this.#endpoint = request.endpoint.replace(/\/$/, "");
+      request = SessionRequestSchema.parse(request);
+      const channel = this.resolveChannel(request.channelId);
+      if (!channel?.endpoint.startsWith("http://")) throw new Error("endpoint");
+      this.#endpoint = channel.endpoint.replace(/\/$/, "");
+      this.#elementOriginActionsSupported = channel.elementOriginActions;
       const response = await this.#request(
         "POST",
         "/session",
@@ -91,43 +138,35 @@ export class Mac2DesktopAdapter implements DesktopPort {
             : undefined;
       if (!sessionId) throw new Error("missing session");
       this.#nativeSessionId = sessionId;
+      this.#bundleId = request.bundleId;
       this.#windowQuery = request.window;
       const capabilities = asObject(value?.capabilities ?? value);
       const automationName = capabilities?.["appium:automationName"] ?? capabilities?.automationName;
       if (automationName !== undefined && automationName !== "Mac2")
         throw new Error("incompatible automation backend");
       const source = await this.#sessionRequest("GET", "/source", undefined, signal);
+      await this.#requireForeground(signal);
       if (typeof source.value !== "string" || !this.#windowMatches(source.value, request.window))
         throw new Error("window readiness");
-      const windowElement = await this.#resolveWindow(request.window, signal);
+      await this.#resolveWindow(request.window, signal);
       await this.#sessionRequest(
         "POST",
         "/actions",
         {
           actions: [
             {
-              type: "pointer",
+              type: "key",
               id: "capability-probe",
-              parameters: { pointerType: "mouse" },
-              actions: [
-                {
-                  type: "pointerMove",
-                  duration: 0,
-                  origin: { [W3C_ELEMENT]: windowElement },
-                  x: 0,
-                  y: 0,
-                },
-              ],
+              actions: [{ type: "pause", duration: 1 }],
             },
           ],
         },
         signal,
       );
-      await this.#sessionRequest("DELETE", "/actions", undefined, signal);
       return ok(
         ProviderReceiptSchema.parse({
           provider: "appium-mac2",
-          operationId: hashId("operation", startedAt) as OperationId,
+          operationId: this.#nextId("operation") as OperationId,
           dispatch: "dispatched",
           outcome: "succeeded",
           startedAt,
@@ -143,6 +182,7 @@ export class Mac2DesktopAdapter implements DesktopPort {
         }
       }
       this.#nativeSessionId = undefined;
+      this.#elementOriginActionsSupported = false;
       this.#locators.clear();
       return err({
         code: signal.aborted ? "Cancelled" : "SessionUnavailable",
@@ -159,7 +199,9 @@ export class Mac2DesktopAdapter implements DesktopPort {
     signal: AbortSignal,
   ): ReturnType<DesktopPort["observe"]> {
     try {
+      request = ObserveRequestSchema.parse(request);
       const sourceResponse = await this.#sessionRequest("GET", "/source", undefined, signal);
+      await this.#requireForeground(signal);
       const windowElementId = await this.#resolveWindow(request.window ?? this.#windowQuery, signal);
       const screenshotResponse = await this.#sessionRequest(
         "GET",
@@ -169,11 +211,17 @@ export class Mac2DesktopAdapter implements DesktopPort {
       );
       if (typeof sourceResponse.value !== "string" || typeof screenshotResponse.value !== "string")
         throw new Error("invalid observation");
-      if (request.window && !this.#windowMatches(sourceResponse.value, request.window))
-        throw new Error("ambiguous window");
-      const parsed = this.#parseElements(sourceResponse.value, request.observationId);
-      const elements = parsed.elements;
-      this.#allElements = parsed.allElements;
+      const selectedWindow = request.window ?? this.#windowQuery;
+      if (!selectedWindow || !this.#windowMatches(sourceResponse.value, selectedWindow))
+        throw new Error("window not found");
+      const screenshot = Buffer.from(screenshotResponse.value, "base64");
+      if (screenshot.toString("base64") !== screenshotResponse.value || screenshot.byteLength === 0)
+        throw new Error("invalid screenshot");
+      const parsed = this.#parseElements(sourceResponse.value, request.observationId, selectedWindow);
+      this.#windowQuery = selectedWindow;
+      const elements = parsed.elements.map((element) => this.#sanitizeElement(element));
+      this.#allElements = parsed.allElements.map((element) => this.#sanitizeElement(element));
+      this.#visualScreenshot = { observationId: request.observationId, bytes: new Uint8Array(screenshot) };
       const observation: Omit<Observation, "screenshot" | "uiSnapshot"> = {
         observationId: request.observationId,
         runId: request.runId,
@@ -201,14 +249,14 @@ export class Mac2DesktopAdapter implements DesktopPort {
           elements,
         }),
       );
-      return ok({ observation, screenshot: Buffer.from(screenshotResponse.value, "base64"), snapshot });
+      return ok({ observation, screenshot, snapshot });
     } catch (error) {
       const detail = error instanceof Error ? error.message : "unknown";
       const code = signal.aborted
         ? "Cancelled"
         : detail.includes("ambiguous window")
           ? "AmbiguousWindowOwner"
-          : detail.includes("window not found")
+          : detail.includes("window not found") || detail.includes("not foreground")
             ? "AppNotForeground"
             : detail.includes("session")
               ? "SessionUnavailable"
@@ -230,8 +278,26 @@ export class Mac2DesktopAdapter implements DesktopPort {
     signal: AbortSignal,
   ): Promise<OperationResult<ProviderReceipt>> {
     const startedAt = new Date().toISOString();
+    const parsedAction = DesktopActionSchema.safeParse(action);
+    if (!parsedAction.success)
+      return err({
+        code: action.kind === "pressKey" ? "UnsupportedKey" : "UnsupportedAction",
+        phase: "action",
+        message: "Action is outside supported capabilities.",
+        retryDisposition: "safe",
+        dispatch: "notDispatched",
+      });
+    action = parsedAction.data;
     try {
       this.#validateActionContext(action);
+      await this.#requireForeground(signal);
+      const source = await this.#sessionRequest("GET", "/source", undefined, signal);
+      if (
+        typeof source.value !== "string" ||
+        !this.#windowQuery ||
+        !this.#windowMatches(source.value, this.#windowQuery)
+      )
+        throw new Error("not foreground");
       if (action.kind === "pressKey")
         await this.#execute(
           "macos: keys",
@@ -252,14 +318,22 @@ export class Mac2DesktopAdapter implements DesktopPort {
         if (action.kind === "replaceText")
           await this.#sessionRequest("POST", `/element/${elementId}/value`, { text }, signal);
         else await this.#execute("macos: keys", { keys: Array.from(text), elementId }, signal);
-      } else if (action.kind === "drag") await this.#drag(action, signal);
-      else {
+      } else if (action.kind === "drag") {
+        if (!this.#elementOriginActionsSupported)
+          return err({
+            code: "UnsupportedAction",
+            phase: "action",
+            message: "Element-origin pointer actions are unavailable.",
+            retryDisposition: "safe",
+            dispatch: "notDispatched",
+          });
+        await this.#drag(action, signal);
+      } else {
         if (!("element" in action.target)) throw new Error("invalid target");
         const ref = action.target.element;
         const elementId = await this.#resolve(ref, signal);
         const point = action.target.point ?? { x: 0.5, y: 0.5 };
-        const locator = this.#locators.get(ref.elementId);
-        if (!locator?.width || !locator.height) throw new Error("geometry");
+        const locator = await this.#currentSize(elementId, signal);
         const payload: JsonObject = {
           elementId,
           x: this.#inset(point.x, locator.width),
@@ -292,17 +366,32 @@ export class Mac2DesktopAdapter implements DesktopPort {
       );
     } catch (error) {
       const message = error instanceof Error ? error.message : "unknown";
-      const code = message.includes("stale")
-        ? "StaleElementRef"
-        : message.includes("ambiguous")
-          ? "TargetAmbiguous"
-          : message.includes("not found")
-            ? "TargetNotFound"
-            : signal.aborted
-              ? "Cancelled"
-              : "ProviderFailure";
+      const code = message.includes("not foreground")
+        ? "AppNotForeground"
+        : message.includes("geometry")
+          ? "UnsupportedAction"
+          : message.includes("stale")
+            ? "StaleElementRef"
+            : message.includes("ambiguous")
+              ? "TargetAmbiguous"
+              : message.includes("not found")
+                ? "TargetNotFound"
+                : message.includes("webdriver:unsupported operation") ||
+                    message.includes("webdriver:unknown command")
+                  ? "UnsupportedAction"
+                  : message.includes("webdriver:invalid argument")
+                    ? "InvalidConfiguration"
+                    : message.includes("webdriver:timeout")
+                      ? "ProviderTimeout"
+                      : signal.aborted
+                        ? "Cancelled"
+                        : "ProviderFailure";
       const beforeDispatch =
-        code === "StaleElementRef" || code === "TargetAmbiguous" || code === "TargetNotFound";
+        code === "StaleElementRef" ||
+        code === "TargetAmbiguous" ||
+        code === "TargetNotFound" ||
+        code === "AppNotForeground" ||
+        code === "UnsupportedAction";
       return err({
         code,
         phase: "action",
@@ -312,11 +401,30 @@ export class Mac2DesktopAdapter implements DesktopPort {
         retryDisposition: beforeDispatch ? "safe" : "reconcileRequired",
         dispatch: beforeDispatch ? "notDispatched" : "unknown",
       });
+    } finally {
+      this.#context = undefined;
+      this.#visualScreenshot = undefined;
+      this.#locators.clear();
+      this.#previousLocators.clear();
     }
   }
 
   rebind(action: DesktopAction, observation: Observation): OperationResult<DesktopAction> {
     const rebindRef = (ref: ElementRef): OperationResult<ElementRef> => {
+      if (
+        ref.runId !== observation.runId ||
+        ref.environmentId !== observation.environmentId ||
+        ref.generation !== observation.generation ||
+        ref.sessionId !== observation.sessionId ||
+        ref.windowId !== observation.windowId
+      )
+        return err({
+          code: "StaleElementRef",
+          phase: "action",
+          message: "Element belongs to a different environment context.",
+          retryDisposition: "safe",
+          dispatch: "notDispatched",
+        });
       const locator = this.#previousLocators.get(ref.elementId) ?? this.#locators.get(ref.elementId);
       if (!locator)
         return err({
@@ -326,14 +434,21 @@ export class Mac2DesktopAdapter implements DesktopPort {
           retryDisposition: "safe",
           dispatch: "notDispatched",
         });
-      const matches = this.#allElements.filter((element) =>
-        locator.identifier
-          ? element.identifier === locator.identifier
-          : element.role === locator.role.replace("XCUIElementType", "").toLowerCase() &&
-            (!locator.name || element.name === locator.name) &&
-            (!locator.label || element.label === locator.label) &&
-            (!locator.value || element.value === locator.value),
-      );
+      const matches = this.#allElements.filter((element) => {
+        if (element.visible === false) return false;
+        if (locator.query) return this.#matches(element, locator.query);
+        return (
+          (!locator.identifier || element.identifier === locator.identifier) &&
+          element.role === locator.role.replace("XCUIElementType", "").toLowerCase() &&
+          (locator.name === undefined || element.name === locator.name) &&
+          (locator.title === undefined || element.name === locator.title) &&
+          (locator.label === undefined || element.label === locator.label) &&
+          (locator.value === undefined || element.value === locator.value) &&
+          (locator.enabled === undefined || element.enabled === locator.enabled) &&
+          (locator.selected === undefined || element.selected === locator.selected) &&
+          (locator.focused === undefined || element.focused === locator.focused)
+        );
+      });
       if (matches.length !== 1 || !matches[0])
         return err({
           code: matches.length === 0 ? "TargetNotFound" : "TargetAmbiguous",
@@ -385,9 +500,70 @@ export class Mac2DesktopAdapter implements DesktopPort {
   async evaluate(
     assertion: AssertionSpec,
     observation: Observation,
+    signal: AbortSignal = new AbortController().signal,
   ): Promise<OperationResult<{ status: "passed" | "failed" | "unverifiable"; reason: string }>> {
-    if (assertion.kind === "aiVisual")
-      return ok({ status: "unverifiable", reason: "AI visual evaluator is not configured." });
+    if (assertion.kind === "aiVisual") {
+      const evaluator = this.visualEvaluator;
+      const screenshot = this.#visualScreenshot;
+      if (
+        !evaluator ||
+        !AssertionSpecSchema.safeParse(assertion).success ||
+        !screenshot ||
+        screenshot.observationId !== observation.observationId ||
+        createHash("sha256").update(screenshot.bytes).digest("hex") !== observation.screenshot.sha256 ||
+        this.#context?.observationId !== observation.observationId ||
+        this.#context.runId !== observation.runId ||
+        this.#context.generation !== observation.generation ||
+        this.#context.sessionId !== observation.sessionId ||
+        this.#context.windowId !== observation.windowId ||
+        signal.aborted
+      )
+        return ok({
+          status: "unverifiable",
+          reason: "Accepted visual evaluation requires a current window screenshot and configured evaluator.",
+        });
+      try {
+        const evaluation = evaluator.evaluate(
+          {
+            goal: assertion.goal,
+            observationId: observation.observationId,
+            screenshot: screenshot.bytes.slice(),
+            mimeType: "image/png",
+          },
+          signal,
+        );
+        let abort: (() => void) | undefined;
+        const cancelled = new Promise<never>((_, reject) => {
+          abort = () => reject(new Error("Visual evaluation cancelled"));
+          signal.addEventListener("abort", abort, { once: true });
+          if (signal.aborted) abort();
+        });
+        let response: unknown;
+        try {
+          response = await Promise.race([evaluation, cancelled]);
+        } finally {
+          if (abort) signal.removeEventListener("abort", abort);
+        }
+        const parsed = VisualEvaluationSchema.safeParse(response);
+        if (
+          !parsed.success ||
+          ((current: AbortSignal) => current.aborted)(signal) ||
+          this.#context.observationId !== observation.observationId
+        )
+          throw new Error("Invalid visual result");
+        return ok({
+          status: parsed.data.status,
+          reason: `aiVisual model=${evaluator.model} screenshot=${observation.screenshot.artifactId} sha256=${observation.screenshot.sha256}`,
+        });
+      } catch {
+        return ok({
+          status: "unverifiable",
+          reason: "Visual evaluator failed or returned invalid evidence.",
+        });
+      }
+    }
+    if (observation.coverage !== "complete")
+      return ok({ status: "unverifiable", reason: "Snapshot coverage is incomplete." });
     if (assertion.kind === "elementOrder") {
       const elements: ElementSummary[] = [];
       for (const query of assertion.queries) {
@@ -420,7 +596,11 @@ export class Mac2DesktopAdapter implements DesktopPort {
     if (assertion.kind === "notVisible")
       return ok({
         status:
-          observation.coverage !== "complete" ? "unverifiable" : matches.length === 0 ? "passed" : "failed",
+          matches.length === 0 || matches.every((element) => element.visible === false)
+            ? "passed"
+            : matches.some((element) => element.visible === true)
+              ? "failed"
+              : "unverifiable",
         reason: "Complete snapshot absence check.",
       });
     if (matches.length !== 1)
@@ -431,10 +611,14 @@ export class Mac2DesktopAdapter implements DesktopPort {
     const element = matches[0];
     if (!element) return ok({ status: "unverifiable", reason: "Assertion target is unavailable." });
     if (assertion.kind === "visible")
-      return ok({ status: "passed", reason: "Unique element is present in the complete snapshot." });
+      return ok({
+        status: element.visible === undefined ? "unverifiable" : element.visible ? "passed" : "failed",
+        reason: "Explicit observed visibility state.",
+      });
     if (assertion.kind === "text" || assertion.kind === "value") {
       const actual =
-        assertion.kind === "value" ? (element.value ?? "") : (element.name ?? element.label ?? "");
+        assertion.kind === "value" ? element.value : element.name || element.label || element.value;
+      if (actual === undefined) return ok({ status: "unverifiable", reason: "Text state is unknown." });
       const passed =
         assertion.match === "contains" ? actual.includes(assertion.expected) : actual === assertion.expected;
       return ok({ status: passed ? "passed" : "failed", reason: "Deterministic text comparison." });
@@ -457,13 +641,16 @@ export class Mac2DesktopAdapter implements DesktopPort {
     try {
       if (this.#nativeSessionId) await this.#sessionRequest("DELETE", "", undefined, signal);
       this.#nativeSessionId = undefined;
+      this.#elementOriginActionsSupported = false;
+      this.#bundleId = undefined;
       this.#locators.clear();
       this.#allElements = [];
       this.#context = undefined;
+      this.#visualScreenshot = undefined;
       this.#windowQuery = undefined;
       return ok({
         provider: "appium-mac2",
-        operationId: hashId("operation", startedAt) as OperationId,
+        operationId: this.#nextId("operation") as OperationId,
         dispatch: "dispatched",
         outcome: "succeeded",
         startedAt,
@@ -498,7 +685,7 @@ export class Mac2DesktopAdapter implements DesktopPort {
     const source =
       this.#context?.observationId === observation.observationId ? this.#allElements : observation.elements;
     const matches = source.filter((element) => this.#matches(element, query));
-    if (matches.length === 0 && observation.coverage !== "complete")
+    if (observation.coverage !== "complete")
       return err({
         code: "SnapshotIncomplete",
         phase: "observe",
@@ -520,6 +707,8 @@ export class Mac2DesktopAdapter implements DesktopPort {
         message: "Snapshot query did not match.",
         retryDisposition: "safe",
       });
+    const locator = this.#locators.get(match.elementId);
+    if (locator) locator.query = structuredClone(query);
     return ok({
       runId: observation.runId,
       environmentId: observation.environmentId,
@@ -531,8 +720,55 @@ export class Mac2DesktopAdapter implements DesktopPort {
     });
   }
 
+  queryPage(
+    observation: Observation,
+    query: ElementQuery,
+    offset: number,
+    limit: number,
+  ): OperationResult<QueryPage> {
+    if (
+      !Number.isSafeInteger(offset) ||
+      offset < 0 ||
+      !Number.isSafeInteger(limit) ||
+      limit < 1 ||
+      limit > 100
+    )
+      return err({
+        code: "InvalidScenario",
+        phase: "observe",
+        message: "Invalid query page bounds.",
+        retryDisposition: "safe",
+      });
+    const current = this.#context?.observationId === observation.observationId;
+    const source = current ? this.#allElements : observation.elements;
+    const matches = source.filter((element) => this.#matches(element, query));
+    const complete = current || observation.coverage === "complete";
+    const resolved =
+      complete && matches.length === 1
+        ? this.query({ ...observation, coverage: "complete" }, query)
+        : undefined;
+    return ok(
+      QueryPageSchema.parse({
+        status: !complete
+          ? "incomplete"
+          : matches.length === 0
+            ? "notFound"
+            : matches.length === 1
+              ? "unique"
+              : "ambiguous",
+        observationId: observation.observationId,
+        count: matches.length,
+        candidates: matches.slice(offset, offset + limit),
+        ...(offset + limit < matches.length ? { nextOffset: offset + limit } : {}),
+        ...(resolved?.ok ? { reference: resolved.value } : {}),
+      }),
+    );
+  }
+
   expand(observation: Observation, elementId: ElementId): OperationResult<ElementSummary> {
-    const element = observation.elements.find((item) => item.elementId === elementId);
+    const source =
+      this.#context?.observationId === observation.observationId ? this.#allElements : observation.elements;
+    const element = source.find((item) => item.elementId === elementId);
     return element
       ? ok(element)
       : err({
@@ -548,15 +784,8 @@ export class Mac2DesktopAdapter implements DesktopPort {
     const destination = await this.#resolve(action.to.element, signal);
     const from = action.from.point ?? { x: 0.5, y: 0.5 };
     const to = action.to.point ?? { x: 0.5, y: 0.5 };
-    const sourceLocator = this.#locators.get(action.from.element.elementId);
-    const destinationLocator = this.#locators.get(action.to.element.elementId);
-    if (
-      !sourceLocator?.width ||
-      !sourceLocator.height ||
-      !destinationLocator?.width ||
-      !destinationLocator.height
-    )
-      throw new Error("geometry");
+    const sourceLocator = await this.#currentSize(source, signal);
+    const destinationLocator = await this.#currentSize(destination, signal);
     await this.#sessionRequest(
       "POST",
       "/actions",
@@ -569,18 +798,18 @@ export class Mac2DesktopAdapter implements DesktopPort {
             actions: [
               {
                 type: "pointerMove",
-                duration: 0,
+                duration: 10,
                 origin: { [W3C_ELEMENT]: source },
-                x: (from.x - 0.5) * sourceLocator.width,
-                y: (from.y - 0.5) * sourceLocator.height,
+                x: this.#inset(from.x, sourceLocator.width) - sourceLocator.width / 2,
+                y: this.#inset(from.y, sourceLocator.height) - sourceLocator.height / 2,
               },
               { type: "pointerDown", button: 0 },
               {
                 type: "pointerMove",
                 duration: action.durationMs ?? 500,
                 origin: { [W3C_ELEMENT]: destination },
-                x: (to.x - 0.5) * destinationLocator.width,
-                y: (to.y - 0.5) * destinationLocator.height,
+                x: this.#inset(to.x, destinationLocator.width) - destinationLocator.width / 2,
+                y: this.#inset(to.y, destinationLocator.height) - destinationLocator.height / 2,
               },
               { type: "pointerUp", button: 0 },
             ],
@@ -594,26 +823,89 @@ export class Mac2DesktopAdapter implements DesktopPort {
   async #resolve(ref: ElementRef, signal: AbortSignal): Promise<string> {
     const locator = this.#locators.get(ref.elementId);
     if (!locator) throw new Error("stale");
-    const using = locator.identifier ? "accessibility id" : "xpath";
-    const value =
-      locator.identifier ??
-      `//${locator.role}${locator.name ? `[@name=${xpathLiteral(locator.name)}]` : locator.label ? `[@label=${xpathLiteral(locator.label)}]` : ""}`;
-    const response = await this.#sessionRequest("POST", "/elements", { using, value }, signal);
+    const using = "xpath";
+    const predicates: string[] = [];
+    for (const field of ["identifier", "name", "title", "label", "value"] as const) {
+      const expected = locator[field];
+      if (expected !== undefined) predicates.push(`@${field}=${xpathLiteral(expected)}`);
+    }
+    for (const field of ["enabled", "selected", "focused"] as const) {
+      const expected = locator[field];
+      if (expected !== undefined) predicates.push(`@${field}=${xpathLiteral(String(expected))}`);
+    }
+    const value = `.//${locator.role}${predicates.length ? `[${predicates.join(" and ")}]` : ""}`;
+    const window = await this.#resolveWindow(this.#windowQuery, signal);
+    const response = await this.#sessionRequest(
+      "POST",
+      `/element/${encodeURIComponent(window)}/elements`,
+      { using, value },
+      signal,
+    );
     const elements = Array.isArray(response.value) ? response.value : [];
     if (elements.length !== 1) throw new Error(elements.length === 0 ? "not found" : "ambiguous");
     const item = asObject(elements[0]);
     const id = typeof item?.[W3C_ELEMENT] === "string" ? item[W3C_ELEMENT] : undefined;
     if (!id) throw new Error("element id");
+    const visible = await this.#sessionRequest(
+      "GET",
+      `/element/${encodeURIComponent(id)}/displayed`,
+      undefined,
+      signal,
+    );
+    if (visible.value !== true && visible.value !== "true") throw new Error("not visible");
     return id;
+  }
+
+  async #currentSize(elementId: string, signal: AbortSignal): Promise<{ width: number; height: number }> {
+    const response = await this.#sessionRequest(
+      "GET",
+      `/element/${encodeURIComponent(elementId)}/rect`,
+      undefined,
+      signal,
+    );
+    const rect = asObject(response.value);
+    const width = rect?.width;
+    const height = rect?.height;
+    if (
+      typeof width !== "number" ||
+      typeof height !== "number" ||
+      !Number.isFinite(width) ||
+      !Number.isFinite(height) ||
+      width <= 0 ||
+      height <= 0
+    )
+      throw new Error("geometry");
+    return { width, height };
+  }
+
+  async #requireForeground(signal: AbortSignal): Promise<void> {
+    if (!this.#bundleId) throw new Error("session");
+    const response = await this.#execute("macos: queryAppState", { bundleId: this.#bundleId }, signal);
+    if (response.value !== 4) throw new Error("not foreground");
   }
 
   async #resolveWindow(query: WindowQuery | undefined, signal: AbortSignal): Promise<string> {
     if (!query) throw new Error("ambiguous window");
     const clauses: string[] = [];
     if (query.title) {
-      if ("exact" in query.title) clauses.push(`@name=${xpathLiteral(query.title.exact)}`);
-      else clauses.push(`contains(@name, ${xpathLiteral(query.title.contains)})`);
+      const upper = "ABCDEFGHIJKLMNOPQRSTUVWXYZ";
+      const lower = "abcdefghijklmnopqrstuvwxyz";
+      const field = query.title.caseSensitive
+        ? "@title"
+        : `translate(@title, ${xpathLiteral(upper)}, ${xpathLiteral(lower)})`;
+      const raw = "exact" in query.title ? query.title.exact : query.title.contains;
+      const expected = query.title.caseSensitive
+        ? raw
+        : raw.replace(/[A-Z]/g, (letter) => letter.toLowerCase());
+      if ("exact" in query.title) clauses.push(`${field}=${xpathLiteral(expected)}`);
+      else clauses.push(`contains(${field}, ${xpathLiteral(expected)})`);
     }
+    if (query.role) {
+      if (query.role !== "window") throw new Error("window not found");
+      clauses.push(`@type=${xpathLiteral("XCUIElementTypeWindow")}`);
+    }
+    if (query.isMain !== undefined) clauses.push(`@main=${xpathLiteral(String(query.isMain))}`);
+    if (query.isModal !== undefined) clauses.push(`@modal=${xpathLiteral(String(query.isModal))}`);
     const xpath = `//XCUIElementTypeWindow${clauses.length ? `[${clauses.join(" and ")}]` : ""}`;
     const response = await this.#sessionRequest(
       "POST",
@@ -633,8 +925,22 @@ export class Mac2DesktopAdapter implements DesktopPort {
   #parseElements(
     xml: string,
     observationId: string,
+    selectedWindow?: WindowQuery,
   ): { elements: ElementSummary[]; allElements: ElementSummary[]; truncated: boolean } {
     if (/<!DOCTYPE|<!ENTITY/i.test(xml)) throw new Error("unsafe xml");
+    if (Buffer.byteLength(xml, "utf8") > 8_000_000) throw new Error("unsafe xml size");
+    let depth = 0;
+    let nodes = 0;
+    for (const match of xml.matchAll(/<([^>]+)>/g)) {
+      const tag = match[1] ?? "";
+      if (tag.startsWith("?") || tag.startsWith("!")) continue;
+      if (tag.startsWith("/")) depth -= 1;
+      else {
+        nodes += 1;
+        if (!tag.endsWith("/")) depth += 1;
+      }
+      if (depth < 0 || depth > 128 || nodes > 20_000) throw new Error("unsafe xml bounds");
+    }
     const parsed: unknown = new XMLParser({
       ignoreAttributes: false,
       attributeNamePrefix: "",
@@ -643,33 +949,60 @@ export class Mac2DesktopAdapter implements DesktopPort {
     const output: ElementSummary[] = [];
     this.#previousLocators = new Map(this.#locators);
     this.#locators.clear();
-    const visit = (value: unknown, roleHint?: string): void => {
+    const visit = (
+      value: unknown,
+      roleHint?: string,
+      inSelectedWindow = selectedWindow === undefined,
+    ): void => {
       if (Array.isArray(value)) {
-        value.forEach((item) => visit(item, roleHint));
+        value.forEach((item) => visit(item, roleHint, inSelectedWindow));
         return;
       }
       const object = asObject(value);
       if (!object) return;
       const role = typeof object.type === "string" ? object.type : roleHint;
-      if (role?.startsWith("XCUIElementType")) {
-        const identity = JSON.stringify([
-          observationId,
-          output.length,
-          object.identifier,
-          object.name,
-          object.label,
-          object.value,
-        ]);
-        const elementId = hashId("element", identity) as ElementId;
+      if (selectedWindow && role === "XCUIElementTypeWindow") {
+        const title =
+          typeof object.title === "string"
+            ? object.title
+            : typeof object.label === "string"
+              ? object.label
+              : undefined;
+        const focused = object.focused === "true" || object.focused === true;
+        const main = object.main === undefined ? focused : object.main === "true" || object.main === true;
+        const modal =
+          object.modal === undefined ? undefined : object.modal === "true" || object.modal === true;
+        if (
+          (selectedWindow.title && (title === undefined || !this.#textMatch(title, selectedWindow.title))) ||
+          (selectedWindow.role && selectedWindow.role !== "window") ||
+          (selectedWindow.isMain !== undefined && selectedWindow.isMain !== main) ||
+          (selectedWindow.isModal !== undefined && selectedWindow.isModal !== modal) ||
+          (object.focused !== undefined && !focused)
+        )
+          return;
+        inSelectedWindow = true;
+      }
+      if (inSelectedWindow && role?.startsWith("XCUIElementType")) {
+        const elementId = this.#nextId("element") as ElementId;
         const summary = ElementSummarySchema.parse({
           elementId,
           role: role.replace("XCUIElementType", "").toLowerCase() || "element",
+          nativeRole: role,
           ...(typeof object.identifier === "string" && object.identifier
             ? { identifier: object.identifier }
             : {}),
-          ...(typeof object.name === "string" && object.name ? { name: object.name } : {}),
-          ...(typeof object.label === "string" && object.label ? { label: object.label } : {}),
-          ...(typeof object.value === "string" && object.value ? { value: object.value } : {}),
+          ...(typeof object.title === "string"
+            ? { name: object.title }
+            : typeof object.name === "string"
+              ? { name: object.name }
+              : {}),
+          ...(typeof object.label === "string" ? { label: object.label } : {}),
+          ...(typeof object.value === "string" ? { value: object.value } : {}),
+          ...(object.visible === "true" || object.visible === true
+            ? { visible: true }
+            : object.visible === "false" || object.visible === false
+              ? { visible: false }
+              : {}),
           ...(object.enabled === "true" || object.enabled === true
             ? { enabled: true }
             : object.enabled === "false" || object.enabled === false
@@ -713,9 +1046,16 @@ export class Mac2DesktopAdapter implements DesktopPort {
         this.#locators.set(elementId, {
           role,
           ...(summary.identifier ? { identifier: summary.identifier } : {}),
-          ...(summary.name ? { name: summary.name } : {}),
-          ...(summary.label ? { label: summary.label } : {}),
-          ...(summary.value ? { value: summary.value } : {}),
+          ...(typeof object.title === "string"
+            ? { title: object.title }
+            : summary.name !== undefined
+              ? { name: summary.name }
+              : {}),
+          ...(summary.label === undefined ? {} : { label: summary.label }),
+          ...(summary.value === undefined ? {} : { value: summary.value }),
+          ...(summary.enabled === undefined ? {} : { enabled: summary.enabled }),
+          ...(summary.selected === undefined ? {} : { selected: summary.selected }),
+          ...(summary.focused === undefined ? {} : { focused: summary.focused }),
           width: Number(object.width),
           height: Number(object.height),
         });
@@ -728,6 +1068,7 @@ export class Mac2DesktopAdapter implements DesktopPort {
             "label",
             "value",
             "enabled",
+            "visible",
             "selected",
             "focused",
             "modal",
@@ -739,27 +1080,34 @@ export class Mac2DesktopAdapter implements DesktopPort {
             "type",
           ].includes(key)
         )
-          visit(child, key);
+          visit(child, key, inSelectedWindow);
     };
     visit(parsed);
     return { elements: output.slice(0, 5000), allElements: output, truncated: output.length > 5000 };
   }
 
   #windowMatches(xml: string, query: WindowQuery): boolean {
-    const elements = this.#parseElements(xml, "observation-window-probe").elements.filter(
-      (item) => item.role === "window",
-    );
-    const matches = elements.filter((window) => {
-      const title = window.name ?? window.label ?? window.value;
-      const textMatch = !query.title || (title !== undefined && this.#textMatch(title, query.title));
-      const roleMatch = !query.role || window.role === query.role;
-      const mainState = window.isMain ?? window.focused;
-      const mainMatch = query.isMain === undefined || mainState === query.isMain;
-      const modalMatch = query.isModal === undefined || window.isModal === query.isModal;
-      const foregroundMatch = window.focused === true;
-      return textMatch && roleMatch && mainMatch && modalMatch && foregroundMatch;
-    });
-    return matches.length === 1;
+    const locators = new Map(this.#locators);
+    const previous = new Map(this.#previousLocators);
+    try {
+      const elements = this.#parseElements(xml, "observation-window-probe").allElements.filter(
+        (item) => item.role === "window",
+      );
+      const matches = elements.filter((window) => {
+        const title = window.name ?? window.label ?? window.value;
+        const textMatch = !query.title || (title !== undefined && this.#textMatch(title, query.title));
+        const roleMatch = !query.role || window.role === query.role;
+        const mainState = window.isMain ?? window.focused;
+        const mainMatch = query.isMain === undefined || mainState === query.isMain;
+        const modalMatch = query.isModal === undefined || window.isModal === query.isModal;
+        const foregroundMatch = window.focused !== false;
+        return textMatch && roleMatch && mainMatch && modalMatch && foregroundMatch;
+      });
+      return matches.length === 1;
+    } finally {
+      this.#locators = locators;
+      this.#previousLocators = previous;
+    }
   }
 
   #textMatch(actual: string, match: TextMatch): boolean {
@@ -767,6 +1115,16 @@ export class Mac2DesktopAdapter implements DesktopPort {
     const raw = "exact" in match ? match.exact : match.contains;
     const expected = match.caseSensitive ? raw : raw.toLocaleLowerCase();
     return "exact" in match ? source === expected : source.includes(expected);
+  }
+
+  #sanitizeElement(element: ElementSummary): ElementSummary {
+    if (!this.sensitive) return element;
+    const result = { ...element };
+    for (const key of ["identifier", "name", "label", "value"] as const) {
+      const value = result[key];
+      if (value !== undefined) result[key] = this.sensitive.sanitizeText(value);
+    }
+    return result;
   }
 
   #matches(
@@ -825,15 +1183,16 @@ export class Mac2DesktopAdapter implements DesktopPort {
     }
   }
   #inset(ratio: number, size: number): number {
-    return Math.min(Math.max(ratio * size, 1), Math.max(1, size - 1));
+    const inset = Math.min(1, size / 2);
+    return Math.min(Math.max(ratio * size, inset), size - inset);
   }
   #modifierFlags(modifiers?: readonly string[]): number {
     const flags: Record<string, number> = {
-      command: 1 << 20,
-      shift: 1 << 17,
-      option: 1 << 19,
-      control: 1 << 18,
-      function: 1 << 23,
+      command: 1 << 4,
+      shift: 1 << 1,
+      option: 1 << 3,
+      control: 1 << 2,
+      function: 1 << 5,
     };
     return (modifiers ?? []).reduce((total, item) => total | (flags[item] ?? 0), 0);
   }
@@ -876,9 +1235,35 @@ export class Mac2DesktopAdapter implements DesktopPort {
         : { headers: { "content-type": "application/json" }, body: JSON.stringify(body) }),
     };
     const response = await this.fetcher(`${this.#endpoint}${path}`, init);
-    const value: unknown = await response.json();
+    const reader = response.body?.getReader();
+    if (!reader) throw new Error("webdriver body");
+    const chunks: Uint8Array[] = [];
+    let size = 0;
+    try {
+      while (!signal.aborted) {
+        const chunk = await reader.read();
+        if (chunk.done) break;
+        const bytes: unknown = chunk.value;
+        if (!(bytes instanceof Uint8Array)) throw new Error("webdriver response type");
+        size += bytes.byteLength;
+        if (size > 16_000_000) {
+          await reader.cancel();
+          throw new Error("webdriver response size");
+        }
+        chunks.push(bytes);
+      }
+    } finally {
+      reader.releaseLock();
+    }
+    const value: unknown = JSON.parse(Buffer.concat(chunks).toString("utf8"));
     const object = asObject(value);
-    if (!response.ok || !object || asObject(object.value)?.error) throw new Error("webdriver");
+    const providerError = asObject(object?.value)?.error;
+    if (!response.ok || !object || typeof providerError === "string")
+      throw new WebDriverFailure(typeof providerError === "string" ? providerError : "transport");
     return object;
+  }
+
+  #nextId(prefix: string): string {
+    return this.ids.next(prefix);
   }
 }

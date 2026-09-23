@@ -13,22 +13,23 @@ export const ImageRequestSchema = z
 export const CloneRequestSchema = z
   .object({
     runId: RunIdSchema,
-    cloneName: z.string().regex(/^mcu-[0-9a-z-]+$/),
     image: z.string().min(1),
     digest: z.string().regex(/^sha256:[a-f0-9]{64}$/),
   })
   .strict();
 export const ManagedCloneRequestSchema = z
-  .object({ cloneName: z.string().regex(/^mcu-[0-9a-z-]+$/), runId: RunIdSchema })
+  .object({ resourceId: z.string().min(1).max(128), runId: RunIdSchema })
   .strict();
 export const CompatibilityProbeSchema = z
   .object({
-    imageDigest: z.string().regex(/^sha256:[a-f0-9]{64}$/),
+    buildIdentity: z.string().regex(/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/),
     bundleId: z.string(),
     compatibility: z
       .object({
         appiumMajor: z.literal(3),
+        appium: z.string(),
         mac2: z.string(),
+        wdaSha256: z.string().regex(/^[a-f0-9]{64}$/),
         guestMacOS: z.string(),
         xcode: z.string(),
         fixtureBuild: z.string(),
@@ -38,11 +39,11 @@ export const CompatibilityProbeSchema = z
   .strict();
 export const ProviderOperationSchema = z.object({ operationId: OperationIdSchema }).strict();
 export const VmStartRequestSchema = z
-  .object({ cloneName: z.string().regex(/^mcu-[0-9a-z-]+$/), network: z.array(NetworkRuleSchema) })
+  .object({ resourceId: z.string().min(1).max(128), network: z.array(NetworkRuleSchema) })
   .strict();
 export const SessionRequestSchema = z
   .object({
-    endpoint: z.url().refine((value) => value.startsWith("http://")),
+    channelId: OperationIdSchema,
     bundleId: z.string(),
     window: WindowQuerySchema,
     arguments: z.array(z.string()).optional(),

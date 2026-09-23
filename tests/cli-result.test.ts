@@ -10,6 +10,8 @@ describe("CLI result mapping", () => {
     [{ verdict: "passed", evidence: "incomplete", cleanup: "completed" }, 12],
     [{ verdict: "passed", evidence: "complete", cleanup: "failed" }, 13],
     [{ verdict: "passed", evidence: "incomplete", cleanup: "failed" }, 14],
+    [{ verdict: "failed", evidence: "incomplete", cleanup: "completed" }, 12],
+    [{ verdict: "inconclusive", evidence: "complete", cleanup: "failed" }, 13],
   ] as const)("maps %j to %i", (result, code) => {
     expect(runExitCode(ok({ result }))).toBe(code);
   });

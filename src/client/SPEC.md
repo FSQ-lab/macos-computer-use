@@ -23,9 +23,9 @@ The package public export provides `createMacOSComputerUseClient(config)` and pu
 
 ## Composition Root
 
-Production composition explicitly constructs TartImageAdapter, TartVmAdapter, TartExecGuestAdapter, Mac2DesktopAdapter, LocalEvidenceAdapter, SystemClock, SecureIdGenerator, FileGatewayLock, configured Hooks, and Kernel. Startup validates Host/Node/Tart and configured Guest compatibility before effects. There is one production path and no reflection, Service Locator, plugin scan, or caller-supplied production Adapter override.
+Production composition explicitly constructs TartImageAdapter, TartVmAdapter, TartExecGuestAdapter, Mac2DesktopAdapter, LocalEvidenceAdapter, SystemClock, SecureIdGenerator, FileGatewayLock, configured isolated Hook Workers, and Kernel. Startup validates Host/Node/Tart and exact OCI digest cache identity before Run allocation. Clone-local Guest/Appium/Mac2/WDA/permission compatibility is validated after allocation but before business work. There is one production path and no reflection, Service Locator, plugin scan, or caller-supplied production Adapter override.
 
-Tests use an internal, unexported test composition function with Fake Ports, deterministic Clock, and deterministic IdGenerator.
+Tests may use the internal, unexported Client construction boundary; deterministic Kernel tests inject Fake Ports, Clock, and IdGenerator directly without exposing them from the package public API.
 
 ## Data And State Flow
 
@@ -58,3 +58,7 @@ Tests cover public exports, strict config parsing, composition version failure b
 
 - Client is the only public programming entry and only production composition root.
 - Public callers cannot bypass Kernel policy or cleanup.
+
+## Explicit AI Visual Evaluation
+
+AI visual evaluation is disabled by default. The Client factory accepts an optional caller-injected visual evaluator separately from serializable GatewayConfig; it is not a provider override. Only a predeclared aiVisual assertion with accepted=true may invoke it. It receives a copy of the current Observation window screenshot, logical observation identity and goal, plus cancellation. Its model identity and strict passed/failed/unverifiable response are validated. The result records the model and screenshot ArtifactRef with the Observation; missing, stale, cancelled or malformed evaluation is unverifiable. No model service, credential, upload destination or background evaluation is inferred.

@@ -1,11 +1,16 @@
 {
   "image": {
     "reference": "ghcr.io/example/macos-computer-use",
-    "digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    "digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "buildIdentity": "fixture-build-1"
   },
   "aut": {
     "bundleId": "com.example.MacOSComputerUseFixture",
-    "window": { "title": { "exact": "Computer Use Fixture" } }
+    "window": {
+      "title": {
+        "exact": "Computer Use Fixture"
+      }
+    }
   },
   "timeouts": {
     "runTotalMs": 600000,
@@ -33,16 +38,29 @@
     "maxRunBytes": 104857600
   },
   "retry": {
-    "imagePull": { "maxAttempts": 2, "backoffMs": 500 },
-    "readiness": { "maxAttempts": 10, "backoffMs": 1000 },
-    "observation": { "maxAttempts": 2, "backoffMs": 250 }
+    "imagePull": {
+      "maxAttempts": 2,
+      "backoffMs": 500
+    },
+    "readiness": {
+      "maxAttempts": 10,
+      "backoffMs": 1000
+    },
+    "observation": {
+      "maxAttempts": 2,
+      "backoffMs": 250
+    }
   },
   "network": [],
-  "secrets": { "allowedNames": [] },
+  "secrets": {
+    "allowedNames": []
+  },
   "compatibility": {
     "tart": "2.35",
     "appiumMajor": 3,
+    "appium": "3.7.0",
     "mac2": "4.3.1",
+    "wdaSha256": "bad71dfeaaa51d3a7224f022c580cdb7424565ca0c4b7f72ad4b0c2b9a339b62",
     "guestMacOS": "26.0",
     "xcode": "26.0",
     "fixtureBuild": "1"

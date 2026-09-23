@@ -1,29 +1,38 @@
-import { createHash } from "node:crypto";
 import { spawn, type ChildProcess } from "node:child_process";
 import {
   err,
   ok,
   type ImagePort,
-  type OperationId,
   type OperationResult,
   type ProviderReceipt,
   ProviderReceiptSchema,
+  ImageRequestSchema,
+  CloneRequestSchema,
+  VmStartRequestSchema,
+  ManagedCloneRequestSchema,
   VmStatusSchema,
   type RunId,
+  RunIdSchema,
+  type IdGenerator,
   type VmPort,
   type VmStatus,
+  CloneResultSchema,
 } from "../../contracts/index.js";
-import { runProcess } from "../process-runner.js";
+import { runProcess } from "./process-runner.js";
 
 const now = (): string => new Date().toISOString();
-const operationId = (input: string): OperationId =>
-  `operation-${createHash("sha256").update(input).digest("hex").slice(0, 24)}` as OperationId;
-
 export class TartAdapter implements ImagePort, VmPort {
   #runningProcess: ChildProcess | undefined;
-  constructor(private readonly executable = "tart") {}
+  constructor(
+    private readonly executable = "tart",
+    private readonly ids: IdGenerator = {
+      next: () => {
+        throw new Error("Tart logical ID generator is unavailable.");
+      },
+    },
+  ) {}
 
-  checkImage(reference: string, digest: string, signal: AbortSignal): Promise<boolean> {
+  checkImage(reference: string, digest: string, signal: AbortSignal): Promise<OperationResult<boolean>> {
     return this.#ociPresent(`${reference}@${digest}`, signal);
   }
 
@@ -31,17 +40,19 @@ export class TartAdapter implements ImagePort, VmPort {
     request: { reference: string; digest: string },
     signal: AbortSignal,
   ): Promise<OperationResult<ProviderReceipt>> {
+    request = ImageRequestSchema.parse(request);
     const startedAt = now();
     const name = `${request.reference}@${request.digest}`;
     const inspected = await this.#ociPresent(name, signal);
-    if (inspected) return ok(this.#receipt("image-inspect", startedAt));
+    if (!inspected.ok) return inspected;
+    if (inspected.value) return ok(this.#receipt("image-inspect", startedAt));
     const pulled = await runProcess(this.executable, ["pull", name], signal);
     if (pulled.aborted)
       return err({
         code: "Cancelled",
         phase: "image",
         message: "Image pull was cancelled.",
-        retryDisposition: "safe",
+        retryDisposition: "reconcileRequired",
         dispatch: "unknown",
       });
     if (pulled.code !== 0)
@@ -49,10 +60,12 @@ export class TartAdapter implements ImagePort, VmPort {
         code: "ProviderFailure",
         phase: "image",
         message: "Tart could not obtain the configured image.",
-        retryDisposition: "safe",
-        dispatch: "notDispatched",
+        retryDisposition: "reconcileRequired",
+        dispatch: "unknown",
       });
-    if (!(await this.#ociPresent(name, signal)))
+    const verified = await this.#ociPresent(name, signal);
+    if (!verified.ok) return verified;
+    if (!verified.value)
       return err({
         code: "ImageDigestMismatch",
         phase: "image",
@@ -76,12 +89,14 @@ export class TartAdapter implements ImagePort, VmPort {
     try {
       const value: unknown = JSON.parse(listed.stdout);
       const names: string[] = [];
+      if (!Array.isArray(value)) throw new Error("inventory shape");
       if (Array.isArray(value))
         for (const item of value) {
-          if (typeof item !== "object" || item === null) continue;
+          if (typeof item !== "object" || item === null) throw new Error("inventory entry");
           const record = item as Record<string, unknown>;
           const name = record.Name;
-          if (typeof name === "string" && name.startsWith("mcu-")) names.push(name);
+          if (typeof name !== "string") throw new Error("inventory name");
+          if (name.startsWith("mcu-run-")) names.push(RunIdSchema.parse(name.slice(4)));
         }
       return ok(names);
     } catch {
@@ -95,11 +110,13 @@ export class TartAdapter implements ImagePort, VmPort {
   }
 
   async clone(
-    request: { runId: RunId; cloneName: string; image: string; digest: string },
+    request: { runId: RunId; image: string; digest: string },
     signal: AbortSignal,
-  ): Promise<OperationResult<{ cloneName: string; receipt: ProviderReceipt }>> {
+  ): Promise<OperationResult<{ resourceId: string; receipt: ProviderReceipt }>> {
+    request = CloneRequestSchema.parse(request);
     const startedAt = now();
-    const cloneName = request.cloneName;
+    const resourceId = request.runId;
+    const cloneName = this.#nativeName(resourceId);
     const result = await runProcess(
       this.executable,
       ["clone", `${request.image}@${request.digest}`, cloneName],
@@ -110,19 +127,22 @@ export class TartAdapter implements ImagePort, VmPort {
         code: result.aborted ? "Cancelled" : "ProviderFailure",
         phase: "vm",
         message: "Tart clone did not complete.",
-        retryDisposition: result.aborted ? "reconcileRequired" : "safe",
-        dispatch: result.aborted ? "unknown" : "notDispatched",
+        retryDisposition: "reconcileRequired",
+        dispatch: "unknown",
       });
-    return ok({ cloneName, receipt: this.#receipt(`clone-${cloneName}`, startedAt) });
+    return ok(
+      CloneResultSchema.parse({ resourceId, receipt: this.#receipt(`clone-${cloneName}`, startedAt) }),
+    );
   }
 
   start(
     request: {
-      cloneName: string;
+      resourceId: string;
       network: readonly { cidr: string; ports: readonly number[]; protocol: "tcp" | "udp" }[];
     },
     signal: AbortSignal,
   ): Promise<OperationResult<ProviderReceipt>> {
+    request = VmStartRequestSchema.parse(request);
     if (signal.aborted)
       return Promise.resolve(
         err({
@@ -135,23 +155,20 @@ export class TartAdapter implements ImagePort, VmPort {
       );
     const startedAt = now();
     return new Promise((resolve) => {
-      const networkArgs =
-        request.network.length === 0
-          ? ["--net-host"]
-          : [
-              "--net-softnet-block",
-              "0.0.0.0/0",
-              "--net-softnet-allow",
-              [...new Set(request.network.map((rule) => rule.cidr))].join(","),
-            ];
-      const child = spawn(this.executable, ["run", ...networkArgs, "--no-clipboard", request.cloneName], {
-        stdio: ["ignore", "ignore", "pipe"],
-      });
+      const networkArgs = ["--net-host"];
+      const child = spawn(
+        this.executable,
+        ["run", ...networkArgs, "--no-clipboard", this.#nativeName(request.resourceId)],
+        {
+          stdio: ["ignore", "ignore", "pipe"],
+        },
+      );
       this.#runningProcess = child;
+      child.stderr.resume();
       let settled = false;
       child.once("spawn", () => {
         settled = true;
-        resolve(ok(this.#receipt("start", startedAt)));
+        resolve(ok({ ...this.#receipt("start", startedAt), outcome: "unknown" }));
       });
       child.once("error", () => {
         if (!settled)
@@ -168,21 +185,25 @@ export class TartAdapter implements ImagePort, VmPort {
       child.once("exit", () => {
         if (this.#runningProcess === child) this.#runningProcess = undefined;
       });
-      signal.addEventListener("abort", () => child.kill("SIGTERM"), { once: true });
+      const abort = (): void => {
+        child.kill("SIGTERM");
+      };
+      signal.addEventListener("abort", abort, { once: true });
+      child.once("exit", () => signal.removeEventListener("abort", abort));
     });
   }
   async stop(cloneName: string, signal: AbortSignal): Promise<OperationResult<ProviderReceipt>> {
-    const result = await this.#command("stop", ["stop", cloneName], signal, true);
+    const result = await this.#command("stop", ["stop", this.#nativeName(cloneName)], signal, true);
     this.#runningProcess?.kill("SIGTERM");
     this.#runningProcess = undefined;
     return result;
   }
   destroy(
-    request: { cloneName: string; runId: RunId },
+    request: { resourceId: string; runId: RunId },
     signal: AbortSignal,
   ): Promise<OperationResult<ProviderReceipt>> {
-    const expected = `mcu-${request.runId.replace(/[^0-9a-z-]/g, "").slice(0, 48)}`;
-    if (request.cloneName !== expected)
+    request = ManagedCloneRequestSchema.parse(request);
+    if (request.resourceId !== request.runId)
       return Promise.resolve(
         err({
           code: "RecoveryRequired",
@@ -191,33 +212,60 @@ export class TartAdapter implements ImagePort, VmPort {
           retryDisposition: "notApplicable",
         }),
       );
-    return this.#command("destroy", ["delete", request.cloneName], signal, true);
+    return this.#command("destroy", ["delete", this.#nativeName(request.resourceId)], signal, true);
   }
 
-  async #ociPresent(name: string, signal: AbortSignal): Promise<boolean> {
+  async #ociPresent(name: string, signal: AbortSignal): Promise<OperationResult<boolean>> {
     const listed = await runProcess(this.executable, ["list", "--source", "oci", "--format", "json"], signal);
-    if (listed.code !== 0) return false;
+    if (listed.code !== 0)
+      return err({
+        code: listed.aborted ? "Cancelled" : "ProviderFailure",
+        phase: "image",
+        message: "OCI image inventory is unavailable.",
+        retryDisposition: "safe",
+        dispatch: "notDispatched",
+      });
     try {
       const value: unknown = JSON.parse(listed.stdout);
-      return (
-        Array.isArray(value) &&
-        value.some((item) => {
-          if (typeof item !== "object" || item === null) return false;
-          return (item as Record<string, unknown>).Name === name;
-        })
-      );
+      if (!Array.isArray(value)) throw new Error("inventory shape");
+      const names = value.map((item) => {
+        if (typeof item !== "object" || item === null) throw new Error("inventory entry");
+        const record = item as Record<string, unknown>;
+        if (record.Source !== "OCI" || typeof record.Name !== "string") throw new Error("inventory identity");
+        return record.Name;
+      });
+      return ok(names.includes(name));
     } catch {
-      return false;
+      return err({
+        code: "ProviderFailure",
+        phase: "image",
+        message: "OCI image inventory is invalid.",
+        retryDisposition: "notApplicable",
+        dispatch: "notDispatched",
+      });
     }
   }
 
   async inspect(cloneName: string, signal: AbortSignal): Promise<OperationResult<VmStatus>> {
-    const result = await runProcess(this.executable, ["get", cloneName, "--format", "json"], signal);
-    if (result.code !== 0) return ok({ exists: false, state: "stopped" });
+    const result = await runProcess(
+      this.executable,
+      ["get", this.#nativeName(cloneName), "--format", "json"],
+      signal,
+    );
+    if (result.code !== 0)
+      return err({
+        code: "ProviderFailure",
+        phase: "vm",
+        message: "VM inspection did not establish resource state.",
+        retryDisposition: "reconcileRequired",
+      });
     try {
       const value = JSON.parse(result.stdout) as Record<string, unknown>;
       return ok(
-        VmStatusSchema.parse({ exists: true, state: value.State === "running" ? "running" : "stopped" }),
+        VmStatusSchema.parse({
+          exists: true,
+          state: value.State === "running" ? "running" : value.State === "stopped" ? "stopped" : "unknown",
+        }),
       );
     } catch {
       return ok({ exists: true, state: "unknown" });
@@ -238,19 +286,23 @@ export class TartAdapter implements ImagePort, VmPort {
       code: result.aborted ? "Cancelled" : "ProviderFailure",
       phase: label === "start" ? "vm" : "cleanup",
       message: `Tart ${label} did not complete.`,
-      retryDisposition: result.aborted ? "reconcileRequired" : "safe",
-      dispatch: result.aborted ? "unknown" : "notDispatched",
+      retryDisposition: "reconcileRequired",
+      dispatch: "unknown",
     });
   }
 
   #receipt(label: string, startedAt: string): ProviderReceipt {
     return ProviderReceiptSchema.parse({
       provider: "tart",
-      operationId: operationId(`${label}-${startedAt}`),
+      operationId: this.ids.next("operation"),
       dispatch: "dispatched",
       outcome: "succeeded",
       startedAt,
       finishedAt: now(),
     });
+  }
+
+  #nativeName(resourceId: string): string {
+    return `mcu-${RunIdSchema.parse(resourceId)}`;
   }
 }

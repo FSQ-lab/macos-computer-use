@@ -48,6 +48,8 @@ Artifact descriptors contain type, relative path, MIME, byte size, SHA-256, and 
 
 A Manifest revision deterministically records Run/build/schema/config/environment/result, event count, complete timeline SHA-256, and Artifact descriptors. Commit uses the Artifact-style atomic/fsync procedure. Normal Run finalization stops ordinary event appends; recovery may append recovery events and create a higher immutable Manifest revision while preserving prior revisions.
 
+Effective configuration and environment snapshots are strictly validated version 2 records. Older snapshot bytes are preserved without automatic migration or relabeling; they are not interpreted as version 2. Other record families retain their existing versions.
+
 Read/show/export verifies Manifest, timeline, Artifact hashes, sizes, relative paths, and schema versions. Mismatch returns `EvidenceCorrupted`. SHA-256 detects accidental integrity loss but is not represented as a signature or malicious-tamper defense.
 
 ## Retention
@@ -56,7 +58,7 @@ Default retention is seven days; `null` disables automatic deletion. Active Runs
 
 ## Sensitive Data
 
-The Adapter never receives secret plaintext as intended metadata. Structured inputs are sanitized before commit. Screenshots and raw diagnostic logs are marked potentially sensitive; the system does not claim complete visual redaction. A sanitization failure rejects the diagnostic Artifact rather than persisting suspected secret content. Debug mode cannot relax these rules.
+The Adapter never receives secret plaintext as intended metadata. Structured inputs are sanitized before commit. Screenshots and raw diagnostic logs are marked potentially sensitive. Window screenshots are stored normally without secret masking or visual secret detection, even when the AUT displays a Secret value. This explicit image exception does not relax structured-data or log sanitization. A sanitization failure rejects the diagnostic Artifact rather than persisting suspected secret content. Debug mode cannot relax these rules.
 
 ## Internal Structure
 

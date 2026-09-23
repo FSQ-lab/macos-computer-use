@@ -13,7 +13,7 @@ Implement DesktopPort through Appium 3 and Mac2 Driver 4.3.1 in the Guest. Own e
 
 ## Public Interface
 
-The DesktopPort implementation starts/stops one explicit session, observes a selected AUT window, queries/expands the latest canonical snapshot, dispatches one validated neutral DesktopAction, and returns a neutral ProviderReceipt. Public outputs never contain Appium/WDA element/session/window IDs, endpoints, XPath, predicates, raw page source, or converted pixel coordinates.
+The DesktopPort implementation starts/stops one explicit session, observes a selected AUT window, queries/expands the latest canonical snapshot, dispatches one validated neutral DesktopAction, and returns a neutral ProviderReceipt. Public outputs never contain Appium/WDA element/session/window IDs, endpoints, XPath, predicates, raw page source, or converted action pixel offsets. Observation-only element geometry (`x`, `y`, `width`, `height`) may be exposed as descriptive data; it is not an action target or an absolute-coordinate fallback.
 
 ## Session And Window Boundary
 
@@ -23,6 +23,8 @@ The DesktopPort implementation starts/stops one explicit session, observes a sel
 - WindowQuery must uniquely identify the current window. Focus loss returns `AppNotForeground`; the Adapter does not reactivate the app during business execution.
 
 ## Canonical Observation
+
+Window screenshots are captured normally, without secret masking or secret-content inspection, and remain potentiallySensitive Evidence. Displayed secret text does not by itself make capture incomplete or disable an explicitly accepted visual assertion. Structured UI text remains subject to known-secret sanitization.
 
 One Observation captures one canonical Mac2 page source plus a window-scoped screenshot within a stable capture window; the two are not represented as perfectly simultaneous. It records coverage/truncation diagnostics and creates logical element identities mapped privately to native handles.
 
@@ -80,5 +82,9 @@ Offline tests cover parser bounds, compact determinism, query conjunction/escapi
 
 - Observation is not an assertion.
 - Only the latest window Observation is actionable.
-- Native IDs and pixel coordinates never cross the Adapter boundary.
+- Native IDs and converted action pixel offsets never cross the Adapter boundary. Observation-only geometry may cross the boundary, but actions accept only the declared element references and normalized relative positions, never absolute coordinates.
 - A Driver success response never confirms business effect.
+
+## Explicit AI Visual Evaluation
+
+AI visual evaluation is disabled by default. The Client factory accepts an optional caller-injected visual evaluator separately from serializable GatewayConfig; it is not a provider override. Only a predeclared aiVisual assertion with accepted=true may invoke it. It receives a copy of the current Observation window screenshot, logical observation identity and goal, plus cancellation. Its model identity and strict passed/failed/unverifiable response are validated. The result records the model and screenshot ArtifactRef with the Observation; missing, stale, cancelled or malformed evaluation is unverifiable. No model service, credential, upload destination or background evaluation is inferred.

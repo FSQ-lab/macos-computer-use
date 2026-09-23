@@ -24,12 +24,12 @@
     "dist"
   ],
   "scripts": {
-    "build": "tsc -p tsconfig.build.json",
+    "build": "node --input-type=module -e \"import { rmSync } from 'node:fs'; rmSync('dist', { recursive: true, force: true })\" && tsc -p tsconfig.build.json",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "test": "vitest run",
     "lint": "eslint .",
     "format:check": "prettier --check 'src/**/*.{ts,js,json}' 'tests/**/*.ts' '*.{js,ts,json}'",
-    "check": "tsc -p tsconfig.json --noEmit && eslint . && prettier --check 'src/**/*.{ts,js,json}' 'tests/**/*.ts' '*.{js,ts,json}' && vitest run && tsc -p tsconfig.build.json"
+    "check": "tsc -p tsconfig.json --noEmit && eslint . && prettier --check 'src/**/*.{ts,js,json}' 'tests/**/*.ts' '*.{js,ts,json}' && pnpm build && vitest run"
   },
   "dependencies": {
     "fast-xml-parser": "5.3.4",
@@ -40,7 +40,7 @@
     "@types/node": "24.12.2",
     "eslint": "9.36.0",
     "prettier": "3.6.2",
-    "typescript": "6.0.3",
+    "typescript": "5.9.3",
     "typescript-eslint": "8.44.1",
     "vitest": "4.1.5"
   }

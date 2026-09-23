@@ -6,3 +6,6 @@ export * from "./observation.js";
 export * from "./ports.js";
 export * from "./port-schemas.js";
 export * from "./results.js";
+export * from "./visual.js";
+export type { SensitiveDataPolicy } from "./sensitive.js";
+export * from "./hooks.js";

@@ -1,4 +1,41 @@
 import SwiftUI
+import AppKit
+
+private struct PointerTarget: NSViewRepresentable {
+  let title: String
+  let identifier: String
+  let onDoubleClick: () -> Void
+  let onRightClick: () -> Void
+
+  final class TargetView: NSView {
+    var onDoubleClick: () -> Void = {}
+    var onRightClick: () -> Void = {}
+    override func mouseDown(with event: NSEvent) {
+      if event.clickCount == 2 { onDoubleClick() }
+    }
+    override func rightMouseDown(with event: NSEvent) { onRightClick() }
+  }
+
+  func makeNSView(context: Context) -> TargetView {
+    let view = TargetView()
+    view.setAccessibilityElement(true)
+    view.setAccessibilityRole(.button)
+    view.setAccessibilityEnabled(true)
+    let label = NSTextField(labelWithString: title)
+    label.setAccessibilityElement(false)
+    label.translatesAutoresizingMaskIntoConstraints = false
+    view.addSubview(label)
+    NSLayoutConstraint.activate([label.centerXAnchor.constraint(equalTo: view.centerXAnchor), label.centerYAnchor.constraint(equalTo: view.centerYAnchor)])
+    return view
+  }
+
+  func updateNSView(_ view: TargetView, context: Context) {
+    view.setAccessibilityIdentifier(identifier)
+    view.setAccessibilityLabel(title)
+    view.onDoubleClick = onDoubleClick
+    view.onRightClick = onRightClick
+  }
+}
 
 @main
 struct FixtureApp: App {
@@ -7,49 +44,43 @@ struct FixtureApp: App {
   }
   var body: some Scene {
     WindowGroup("Computer Use Fixture") { FixtureView() }
-      .defaultSize(width: 680, height: 520)
+      .defaultSize(width: 760, height: 850)
   }
 }
 
 private struct FixtureView: View {
-  @State private var status = "Ready"
-  @State private var text = ""
-  @State private var checked = false
-  @State private var hover = false
-  @State private var dropped = false
-  @State private var showModal = false
-  @State private var hiddenVisible = true
+  @State private var fixture = FixtureState()
 
   var body: some View {
     VStack(alignment: .leading, spacing: 16) {
       Text("macOS Computer Use Fixture").font(.title).accessibilityIdentifier("fixture.title")
-      Text(status).accessibilityIdentifier("fixture.status")
+      Text(fixture.status).accessibilityIdentifier("fixture.status")
 
       HStack {
-        Button("Click") { status = "Clicked" }.accessibilityIdentifier("fixture.click")
-        Button("Double click") { status = "Double clicked" }.accessibilityIdentifier("fixture.double-click")
-        Button("Right click") { status = "Right clicked" }
-          .accessibilityIdentifier("fixture.right-click")
-          .contextMenu { Button("Context action") { status = "Context selected" } }
-        Button("Hover") { status = "Hover clicked" }
+        Button("Click") { fixture.status = "Clicked" }.accessibilityIdentifier("fixture.click")
+        PointerTarget(title: "Double click", identifier: "fixture.double-click", onDoubleClick: { fixture.status = "Double clicked" }, onRightClick: {})
+          .frame(width: 100, height: 30)
+        PointerTarget(title: "Right click", identifier: "fixture.right-click", onDoubleClick: {}, onRightClick: { fixture.status = "Right clicked" })
+          .frame(width: 100, height: 30)
+        Button("Hover") { fixture.status = "Hover clicked" }
           .accessibilityIdentifier("fixture.hover")
-          .onHover { value in hover = value; status = value ? "Hovered" : "Ready" }
-        Text(hover ? "Hover active" : "Hover idle").accessibilityIdentifier("fixture.hover-state")
+          .onHover { value in fixture.hover = value; fixture.status = value ? "Hovered" : "Ready" }
+        Text(fixture.hover ? "Hover active" : "Hover idle").accessibilityIdentifier("fixture.hover-state")
       }
 
-      TextField("Text input", text: $text)
+      TextField("Text input", text: $fixture.text)
         .accessibilityIdentifier("fixture.text-input")
-      Text(text).accessibilityIdentifier("fixture.text-value")
-      Toggle("Checked", isOn: $checked).accessibilityIdentifier("fixture.checkbox")
+      Text(fixture.text).accessibilityIdentifier("fixture.text-value")
+      Toggle("Checked", isOn: $fixture.checked).accessibilityIdentifier("fixture.checkbox")
       HStack {
         Text("First").accessibilityIdentifier("fixture.order.first")
         Text("Second").accessibilityIdentifier("fixture.order.second")
       }
-      if hiddenVisible { Text("Hide me").accessibilityIdentifier("fixture.hide-target") }
-      Button("Hide target") { hiddenVisible = false }.accessibilityIdentifier("fixture.hide")
-      Button("Open modal") { showModal = true }.accessibilityIdentifier("fixture.open-modal")
-      Button("Keyboard action") { status = "Keyboard activated" }
-        .keyboardShortcut("k", modifiers: [.command])
+      if fixture.hiddenVisible { Text("Hide me").accessibilityIdentifier("fixture.hide-target") }
+      Button("Hide target") { fixture.hiddenVisible = false }.accessibilityIdentifier("fixture.hide")
+      Button("Open modal") { fixture.showModal = true }.accessibilityIdentifier("fixture.open-modal")
+      Button("Keyboard action") { fixture.status = "Keyboard activated" }
+        .keyboardShortcut(.return, modifiers: [.command])
         .accessibilityIdentifier("fixture.keyboard")
 
       ScrollView(.horizontal) {
@@ -60,6 +91,13 @@ private struct FixtureView: View {
         }
       }
       .accessibilityIdentifier("fixture.scroll")
+      .id(fixture.scrollGeneration)
+      .onScrollGeometryChange(for: Int.self) { geometry in
+        Int(geometry.contentOffset.x.rounded())
+      } action: { _, offset in
+        fixture.scrollOffset = offset
+      }
+      Text("Scroll offset: \(fixture.scrollOffset)").accessibilityIdentifier("fixture.scroll-state")
 
       HStack(spacing: 40) {
         Text("Drag source")
@@ -67,35 +105,29 @@ private struct FixtureView: View {
           .background(.blue.opacity(0.2))
           .accessibilityIdentifier("fixture.drag-source")
           .draggable("fixture-drag")
-        Text(dropped ? "Dropped" : "Drop target")
+        Text(fixture.dropped ? "Dropped" : "Drop target")
           .frame(width: 180, height: 70)
           .background(.green.opacity(0.2))
           .accessibilityIdentifier("fixture.drop-target")
           .dropDestination(for: String.self) { values, _ in
-            dropped = values.contains("fixture-drag")
-            status = dropped ? "Drag completed" : status
-            return dropped
+            fixture.dropped = values.contains("fixture-drag")
+            fixture.status = fixture.dropped ? "Drag completed" : fixture.status
+            return fixture.dropped
           }
       }
 
       Button("Reset") {
-        status = "Ready"
-        text = ""
-        checked = false
-        hover = false
-        dropped = false
-        showModal = false
-        hiddenVisible = true
+        fixture.reset()
       }
         .accessibilityIdentifier("fixture.reset")
     }
     .padding(24)
-    .frame(minWidth: 640, minHeight: 480)
+    .frame(minWidth: 720, minHeight: 800)
     .keyboardShortcut("r", modifiers: [.command])
-    .sheet(isPresented: $showModal) {
+    .sheet(isPresented: $fixture.showModal) {
       VStack {
         Text("Fixture modal").accessibilityIdentifier("fixture.modal.title")
-        Button("Close") { showModal = false }.accessibilityIdentifier("fixture.modal.close")
+        Button("Close") { fixture.showModal = false }.accessibilityIdentifier("fixture.modal.close")
       }.padding(30)
     }
   }

@@ -16,8 +16,9 @@ GuestPort exposes fixed typed operations for live probes, known service lifecycl
 
 ## Data And State Flow
 
-- Guest readiness proves the Guest Agent, user desktop session, required executables, and fixed compatibility metadata through live commands.
-- Appium starts in a Run-specific Guest temporary directory on fixed port 4723, with bounded sanitized logging.
+- Guest readiness runs on the fresh disposable clone and proves the Guest Agent, user desktop session, required executables, Appium patch, Mac2/WDA identity, Fixture identity, and fixed compatibility metadata through live commands. Session/source/window readiness then proves usable automation permission before any business action. These live facts cannot be obtained before clone allocation; Host/static compatibility and exact OCI digest cache identity are the pre-allocation gate.
+- `/etc/macos-computer-use/image-digest` contains an independent image build identity, not the final OCI manifest digest. Guest readiness validates it and Fixture/toolchain metadata against Host expectations bound to the configured immutable OCI digest; Host image verification owns final OCI digest validation.
+- Appium starts in a Run-specific Guest temporary directory on fixed port 4723. Raw Appium request logging is disabled so SecretRef values are not written before sanitization; exported diagnostics contain only bounded, generated lifecycle summaries and sanitized Guest metadata.
 - Host obtains the Guest address through Tart's Agent resolver; endpoint use is restricted to the active Run.
 - Stop is attempted before VM destruction and is idempotent when the service is absent.
 - Appium/WDA/Guest diagnostic files are exported during finalization as a bounded relative-path archive stream.
@@ -50,3 +51,7 @@ Tests cover fixed-command enforcement, readiness parsing, endpoint secrecy, Appi
 - Public inputs cannot request arbitrary Guest execution.
 - Guest temporary data is not a retention store.
 - No Host user directory or writable Evidence directory is shared into Guest.
+
+## Host-only Network Rules
+
+V1 NetworkRules constrain only destinations reachable inside the Host-only network. They do not provide Internet access or enable NAT, bridging, public forwarding, or Host-mediated egress. Nonempty rules preserve Tart Host-only mode and constrain Guest traffic by CIDR, port and protocol; the control channel and DHCP remain available. Effective filtering must be verified before business work. Rules never cause automatic network relaxation.

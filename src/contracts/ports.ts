@@ -1,6 +1,6 @@
 import type { DesktopAction, AssertionSpec } from "./actions.js";
 import type { ArtifactDescriptor, EvidenceEvent, ManagedResourceRecord, RunManifest } from "./evidence.js";
-import type { ElementQuery, ElementRef, ElementSummary, Observation } from "./observation.js";
+import type { ElementQuery, ElementRef, ElementSummary, Observation, QueryPage } from "./observation.js";
 import type { ElementId, OperationId, RunId } from "./ids.js";
 import type { OperationResult, ProbeResult, ProviderReceipt, RunResult, VmStatus } from "./results.js";
 import type {
@@ -22,29 +22,33 @@ export interface VmPort {
   clone(
     request: CloneRequest,
     signal: AbortSignal,
-  ): Promise<OperationResult<{ cloneName: string; receipt: ProviderReceipt }>>;
+  ): Promise<OperationResult<{ resourceId: string; receipt: ProviderReceipt }>>;
   start(request: VmStartRequest, signal: AbortSignal): Promise<OperationResult<ProviderReceipt>>;
-  inspect(cloneName: string, signal: AbortSignal): Promise<OperationResult<VmStatus>>;
-  stop(cloneName: string, signal: AbortSignal): Promise<OperationResult<ProviderReceipt>>;
+  inspect(resourceId: string, signal: AbortSignal): Promise<OperationResult<VmStatus>>;
+  stop(resourceId: string, signal: AbortSignal): Promise<OperationResult<ProviderReceipt>>;
   destroy(request: ManagedCloneRequest, signal: AbortSignal): Promise<OperationResult<ProviderReceipt>>;
 }
 export interface GuestPort {
   probe(
-    cloneName: string,
+    resourceId: string,
     expected: CompatibilityProbe,
     signal: AbortSignal,
   ): Promise<OperationResult<ProbeResult>>;
   configureNetwork(
-    cloneName: string,
+    resourceId: string,
     rules: readonly { cidr: string; ports: readonly number[]; protocol: "tcp" | "udp" }[],
     signal: AbortSignal,
   ): Promise<OperationResult<ProviderReceipt>>;
   startAppium(
-    cloneName: string,
+    resourceId: string,
     signal: AbortSignal,
-  ): Promise<OperationResult<{ endpoint: string; receipt: ProviderReceipt }>>;
-  stopAppium(cloneName: string, signal: AbortSignal): Promise<OperationResult<ProviderReceipt>>;
-  exportDiagnostics(cloneName: string, signal: AbortSignal): Promise<OperationResult<Uint8Array>>;
+  ): Promise<OperationResult<{ channelId: OperationId; receipt: ProviderReceipt }>>;
+  stopAppium(resourceId: string, signal: AbortSignal): Promise<OperationResult<ProviderReceipt>>;
+  exportDiagnostics(
+    resourceId: string,
+    limits: { maxFileBytes: number; maxTotalBytes: number },
+    signal: AbortSignal,
+  ): Promise<OperationResult<Uint8Array>>;
 }
 export interface DesktopPort {
   startSession(request: SessionRequest, signal: AbortSignal): Promise<OperationResult<ProviderReceipt>>;
@@ -71,23 +75,44 @@ export interface DesktopPort {
   ): Promise<OperationResult<{ status: "passed" | "failed" | "unverifiable"; reason: string }>>;
   compact(observation: Observation): string;
   query(observation: Observation, query: ElementQuery): OperationResult<ElementRef>;
+  queryPage?(
+    observation: Observation,
+    query: ElementQuery,
+    offset: number,
+    limit: number,
+  ): OperationResult<QueryPage>;
   expand(observation: Observation, elementId: ElementId): OperationResult<ElementSummary>;
   stopSession(signal: AbortSignal): Promise<OperationResult<ProviderReceipt>>;
 }
 export interface EvidencePort {
-  preflight(runId: RunId): Promise<OperationResult<void>>;
-  recoverOrphans(runId: RunId): Promise<OperationResult<number>>;
-  append(event: EvidenceEvent): Promise<OperationResult<void>>;
-  commitArtifact(request: ArtifactCommitRequest): Promise<OperationResult<ArtifactDescriptor>>;
-  commitManifest(manifest: RunManifest): Promise<OperationResult<{ relativePath: string; sha256: string }>>;
+  reconcileProjections(signal?: AbortSignal): Promise<OperationResult<void>>;
+  recordDamagedRun(
+    runId: RunId,
+    buildVersion: string,
+    cleanup: "completed" | "failed",
+    signal?: AbortSignal,
+  ): Promise<OperationResult<void>>;
+  listUnfinishedRuns(signal?: AbortSignal): Promise<OperationResult<readonly RunId[]>>;
+  preflight(runId: RunId, signal?: AbortSignal): Promise<OperationResult<void>>;
+  recoverOrphans(runId: RunId, signal?: AbortSignal): Promise<OperationResult<number>>;
+  append(event: EvidenceEvent, signal?: AbortSignal): Promise<OperationResult<void>>;
+  commitArtifact(
+    request: ArtifactCommitRequest,
+    signal?: AbortSignal,
+  ): Promise<OperationResult<ArtifactDescriptor>>;
+  commitManifest(
+    manifest: RunManifest,
+    signal?: AbortSignal,
+  ): Promise<OperationResult<{ relativePath: string; sha256: string }>>;
   commitRecoveryManifest(
     runId: RunId,
     buildVersion: string,
     result: RunResult,
     artifacts?: readonly ArtifactDescriptor[],
+    signal?: AbortSignal,
   ): Promise<OperationResult<{ relativePath: string; sha256: string }>>;
-  readTimeline(runId: RunId): Promise<OperationResult<readonly EvidenceEvent[]>>;
-  readManagedResource(): Promise<OperationResult<ManagedResourceRecord | null>>;
-  writeManagedResource(record: ManagedResourceRecord): Promise<OperationResult<void>>;
-  clearManagedResource(): Promise<OperationResult<void>>;
+  readTimeline(runId: RunId, signal?: AbortSignal): Promise<OperationResult<readonly EvidenceEvent[]>>;
+  readManagedResource(signal?: AbortSignal): Promise<OperationResult<ManagedResourceRecord | null>>;
+  writeManagedResource(record: ManagedResourceRecord, signal?: AbortSignal): Promise<OperationResult<void>>;
+  clearManagedResource(signal?: AbortSignal): Promise<OperationResult<void>>;
 }

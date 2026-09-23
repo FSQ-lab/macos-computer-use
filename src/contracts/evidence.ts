@@ -1,6 +1,14 @@
 import { z } from "zod";
-import { ArtifactIdSchema, ObservationIdSchema, RunIdSchema } from "./ids.js";
-import { RunResultSchema } from "./results.js";
+import {
+  ActionIdSchema,
+  ArtifactIdSchema,
+  ObservationIdSchema,
+  OperationIdSchema,
+  RunIdSchema,
+} from "./ids.js";
+import { ActionResultSchema, RunResultSchema } from "./results.js";
+import { GatewayConfigSchema } from "./config.js";
+import type { RunId } from "./ids.js";
 
 export const Sha256Schema = z.string().regex(/^[a-f0-9]{64}$/);
 export const RelativePathSchema = z
@@ -29,6 +37,7 @@ export const EventTypeSchema = z.enum([
   "ObservationCaptured",
   "ActionPlanned",
   "ProviderReceiptRecorded",
+  "ActionResultRecorded",
   "AssertionEvaluated",
   "ArtifactCommitted",
   "EvidenceCollectionFailed",
@@ -59,7 +68,9 @@ const EventDataSchemas = {
       uiSnapshot: ArtifactRefSchema.optional(),
     })
     .strict(),
-  ActionPlanned: z.object({ operationId: z.string(), kind: z.string() }).strict(),
+  ActionPlanned: z
+    .object({ actionId: ActionIdSchema, operationId: OperationIdSchema, kind: z.string() })
+    .strict(),
   ProviderReceiptRecorded: z
     .object({
       provider: z.string(),
@@ -70,6 +81,9 @@ const EventDataSchemas = {
       finishedAt: z.iso.datetime().optional(),
       diagnosticRef: ArtifactRefSchema.optional(),
     })
+    .strict(),
+  ActionResultRecorded: z
+    .object({ actionId: ActionIdSchema, operationId: OperationIdSchema, result: ActionResultSchema })
     .strict(),
   AssertionEvaluated: z
     .object({
@@ -85,7 +99,7 @@ const EventDataSchemas = {
   EvidenceCollectionFailed: z.object({ stage: z.string(), code: z.string() }).strict(),
   CleanupStarted: z.object({}).strict(),
   CleanupFinished: z.object({ status: z.enum(["completed", "failed"]) }).strict(),
-  RunRecoveryStarted: z.object({ cloneName: z.string() }).strict(),
+  RunRecoveryStarted: z.object({ resourceId: z.string() }).strict(),
   RunRecoveryFinished: z.object({ status: z.enum(["completed", "failed"]) }).strict(),
   HookFailed: z.object({ hook: z.string(), code: z.string() }).strict(),
   RunFinished: RunResultSchema,
@@ -111,6 +125,7 @@ export const EvidenceEventSchema = z
     if (!parsed.success)
       ctx.addIssue({ code: "custom", path: ["data"], message: `Invalid data for ${event.type}.` });
   });
+export const CurrentEvidenceEventSchema = EvidenceEventSchema;
 
 export const RunManifestSchema = z
   .object({
@@ -128,13 +143,20 @@ export const RunManifestSchema = z
   })
   .strict();
 
+const ManagedResourcePhaseSchema = z.enum([
+  "clonePlanned",
+  "cloneCreated",
+  "started",
+  "cleanupStarted",
+  "cleanupCompleted",
+]);
 export const ManagedResourceRecordSchema = z
   .object({
     schemaVersion: z.literal(1),
     runId: RunIdSchema,
-    cloneName: z.string().regex(/^mcu-[0-9a-z-]+$/),
+    resourceId: z.string().min(1).max(128),
     imageDigest: z.string().regex(/^sha256:[a-f0-9]{64}$/),
-    phase: z.enum(["clonePlanned", "cloneCreated", "started", "cleanupStarted", "cleanupCompleted"]),
+    phase: ManagedResourcePhaseSchema,
   })
   .strict();
 export const RunIndexEntrySchema = z
@@ -153,31 +175,103 @@ export const StepProjectionSchema = z
     status: z.enum(["completed", "failed", "notRun"]),
   })
   .strict();
-export const EnvironmentSnapshotSchema = z
+export const DamagedRunRecoverySchema = z
   .object({
     schemaVersion: z.literal(1),
-    cloneName: z.string(),
+    runId: RunIdSchema,
+    status: z.literal("failed"),
+    recordedAt: z.iso.datetime(),
+    buildVersion: z.string().min(1),
+    timelineSha256: Sha256Schema,
+    timelineBytes: z.number().int().nonnegative(),
+    unknownDispatch: z.literal(true),
+    result: z.object({
+      verdict: z.literal("inconclusive"),
+      evidence: z.literal("incomplete"),
+      cleanup: z.enum(["completed", "failed"]),
+    }),
+  })
+  .strict();
+export const EnvironmentSnapshotSchema = z
+  .object({
+    schemaVersion: z.literal(2),
+    buildIdentity: z.string().min(1),
     imageDigest: z.string().regex(/^sha256:[a-f0-9]{64}$/),
-    compatibility: z.object({ tart: z.string(), appiumMajor: z.literal(3), mac2: z.string() }).strict(),
+    compatibility: z
+      .object({
+        tart: z.string(),
+        appiumMajor: z.literal(3),
+        appium: z.string(),
+        mac2: z.string(),
+        wdaSha256: Sha256Schema,
+        guestMacOS: z.string(),
+        xcode: z.string(),
+        fixtureBuild: z.string(),
+      })
+      .strict(),
     bundleId: z.string(),
+    actual: z
+      .object({
+        guestMacOS: z.string(),
+        xcode: z.string(),
+        appium: z.string(),
+        mac2: z.string(),
+        wdaSha256: Sha256Schema,
+        buildIdentity: z.string(),
+        fixtureBuild: z.string(),
+        bundleId: z.string(),
+        windowServerReady: z.boolean(),
+        automationPermissionReady: z.boolean(),
+      })
+      .strict()
+      .optional(),
   })
   .strict();
 export const ConfigSnapshotSchema = z
   .object({
-    schemaVersion: z.literal(1),
-    image: z.object({ reference: z.string(), digest: z.string() }).strict(),
-    bundleId: z.string(),
-    secretNames: z.array(z.string()),
-    retentionDays: z.number().int().positive().nullable(),
+    schemaVersion: z.literal(2),
+    image: z
+      .object({
+        reference: z.string(),
+        digest: z.string().regex(/^sha256:[a-f0-9]{64}$/),
+        buildIdentity: z.string().min(1),
+      })
+      .strict(),
+    aut: z.lazy(() => GatewayConfigSchema.shape.aut.omit({ window: true })),
+    timeouts: z.lazy(() => GatewayConfigSchema.shape.timeouts),
+    evidence: z.lazy(() => GatewayConfigSchema.shape.evidence.omit({ root: true })),
+    network: z.lazy(() => GatewayConfigSchema.shape.network),
+    secrets: z.lazy(() => GatewayConfigSchema.shape.secrets),
+    compatibility: z.lazy(() => GatewayConfigSchema.shape.compatibility),
   })
   .strict();
 
 export type ArtifactRef = z.infer<typeof ArtifactRefSchema>;
 export type ArtifactDescriptor = z.infer<typeof ArtifactDescriptorSchema>;
-export type EvidenceEvent = z.infer<typeof EvidenceEventSchema>;
+type EventDataByType = {
+  [K in keyof typeof EventDataSchemas]: z.infer<(typeof EventDataSchemas)[K]>;
+};
+export type EvidenceEvent = {
+  [K in keyof EventDataByType]: {
+    schemaVersion: 1;
+    runId: RunId;
+    sequence: number;
+    recordedAt: string;
+    elapsedMs: number;
+    type: K;
+    source: "kernel" | "adapter" | "hook";
+    provider?: string;
+    data: EventDataByType[K];
+  };
+}[keyof EventDataByType];
+export const parseEvidenceEvent = (value: unknown): EvidenceEvent =>
+  EvidenceEventSchema.parse(value) as EvidenceEvent;
+export const parseCurrentEvidenceEvent = (value: unknown): EvidenceEvent =>
+  CurrentEvidenceEventSchema.parse(value) as EvidenceEvent;
 export type RunManifest = z.infer<typeof RunManifestSchema>;
 export type ManagedResourceRecord = z.infer<typeof ManagedResourceRecordSchema>;
 export type RunIndexEntry = z.infer<typeof RunIndexEntrySchema>;
 export type StepProjection = z.infer<typeof StepProjectionSchema>;
+export type DamagedRunRecovery = z.infer<typeof DamagedRunRecoverySchema>;
 export type EnvironmentSnapshot = z.infer<typeof EnvironmentSnapshotSchema>;
 export type ConfigSnapshot = z.infer<typeof ConfigSnapshotSchema>;

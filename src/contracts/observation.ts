@@ -40,10 +40,12 @@ export const ElementSummarySchema = z
   .object({
     elementId: ElementIdSchema,
     role: z.string().min(1),
+    nativeRole: z.string().min(1).optional(),
     identifier: z.string().optional(),
     name: z.string().optional(),
     label: z.string().optional(),
     value: z.string().optional(),
+    visible: z.boolean().optional(),
     enabled: z.boolean().optional(),
     selected: z.boolean().optional(),
     focused: z.boolean().optional(),
@@ -96,3 +98,15 @@ export type WindowQuery = z.infer<typeof WindowQuerySchema>;
 export type ElementSummary = z.infer<typeof ElementSummarySchema>;
 export type Observation = z.infer<typeof ObservationSchema>;
 export type ElementRef = z.infer<typeof ElementRefSchema>;
+
+export const QueryPageSchema = z
+  .object({
+    status: z.enum(["unique", "ambiguous", "notFound", "incomplete"]),
+    observationId: ObservationIdSchema,
+    count: z.number().int().nonnegative(),
+    candidates: z.array(ElementSummarySchema).max(100),
+    nextOffset: z.number().int().nonnegative().optional(),
+    reference: ElementRefSchema.optional(),
+  })
+  .strict();
+export type QueryPage = z.infer<typeof QueryPageSchema>;

@@ -69,6 +69,8 @@ type RunResult = {
 
 A canonical `Observation` binds Run, environment, generation, session, logical window, observation ID, captured time, screenshot/UI snapshot ArtifactRefs, completeness diagnostics, and logical element summaries. It never exposes Appium/WDA/native IDs.
 
+Element summaries may expose observation-only geometry (`x`, `y`, `width`, `height`) as descriptive data. This does not authorize absolute-coordinate action inputs or fallback. Element-targeted actions still use ElementRefs and, where applicable, normalized relative positions; converted action pixel offsets remain Adapter-private.
+
 `ElementQuery` supports conjunctive neutral role, identifier, exact/contains name, label, value, and enabled/selected/focused state filters. Query results are `unique`, `ambiguous`, `notFound`, or `incomplete`. Unknown state is not false. Only a unique result creates an `ElementRef`.
 
 `WindowQuery` supports title text matching, role, main-window and modal filters. Window selection must be unique.
@@ -100,17 +102,21 @@ A strict `Scenario` has `schemaVersion: 1`, a safe non-empty name, ordered uniqu
 
 `GatewayConfig` strictly owns immutable OCI reference/digest, AUT bundle ID and allowlisted arguments/environment keys, phase/Run/cleanup timeouts, Evidence root/retention, retry profiles, compatible runtime versions, bounded Artifact policies, and frozen NetworkRules. Unknown fields are rejected.
 
+Image compatibility expectations include an independent Guest build identity bound to the configured OCI digest. The final OCI digest and Host/static matrix are checked before allocation; Guest build/toolchain/WDA/permission readiness is independently live-probed on the disposable clone before business work, without requiring an image to embed its own final OCI digest.
+
+Hook configuration is a strict serializable module descriptor containing a validated name and absolute module path. Hook modules execute only in terminable Worker isolation and export the documented async handler. Arbitrary in-process Hook callbacks are not a public contract.
+
 `NetworkRule` contains a non-open CIDR, non-empty bounded port list, and TCP/UDP protocol. Domain rules and unrestricted CIDRs are invalid.
 
 `SecretRef` contains an allowlisted name and purpose `textInput` or `appEnvironment`. It never contains the secret value.
 
 ### Persistence
 
-Each persisted record family carries independent `schemaVersion: 1`. Writers emit only current versions. Readers reject interpretation of unknown or higher versions while preserving the bytes. Persisted contracts include typed Evidence events, resource ownership records, Run index entries, Artifact descriptors, Step projections, Manifest revisions, and sanitized effective configuration snapshots.
+Persisted record families carry independent versions. Effective configuration and environment snapshots use `schemaVersion: 2`; all other existing record families retain `schemaVersion: 1`. Version 2 snapshots use strict schemas and include sanitized effective settings and image/build compatibility identity. Version 1 snapshot bytes are preserved without automatic migration or relabeling; readers do not interpret them as version 2. Writers emit only current versions. Readers reject interpretation of unknown or higher versions while preserving the bytes. Persisted contracts include typed Evidence events, resource ownership records, Run index entries, Artifact descriptors, Step projections, Manifest revisions, and sanitized effective configuration snapshots.
 
 ### Ports
 
-Contracts exports provider-neutral `ImagePort`, `VmPort`, `GuestPort`, `DesktopPort`, and `EvidencePort`. Every asynchronous provider operation accepts an `AbortSignal` and returns validated neutral results or normalized errors. Ports perform one provider operation per call and contain no retry or orchestration contract.
+Contracts exports provider-neutral `ImagePort`, `VmPort`, `GuestPort`, `DesktopPort`, and `EvidencePort`. Resource and driver-channel handles are opaque logical identifiers; Provider endpoints and native naming remain inside Adapter composition. Every asynchronous provider operation accepts an `AbortSignal` and returns validated neutral results or normalized errors. Ports perform one provider operation per call and contain no retry or orchestration contract.
 
 ## Internal Structure
 
@@ -139,3 +145,11 @@ Tests cover valid/invalid parsing, unknown-field rejection, brands, discriminate
 - Provider and Host implementation details never enter neutral Contracts.
 - No action schema can encode absolute coordinates.
 - Public IDs cannot be substituted for one another without validation.
+
+## Host-only Network Rules
+
+V1 NetworkRules constrain only destinations reachable inside the Host-only network. They do not provide Internet access or enable NAT, bridging, public forwarding, or Host-mediated egress. Nonempty rules preserve Tart Host-only mode and constrain Guest traffic by CIDR, port and protocol; the control channel and DHCP remain available. Effective filtering must be verified before business work. Rules never cause automatic network relaxation.
+
+## Explicit AI Visual Evaluation
+
+AI visual evaluation is disabled by default. The Client factory accepts an optional caller-injected visual evaluator separately from serializable GatewayConfig; it is not a provider override. Only a predeclared aiVisual assertion with accepted=true may invoke it. It receives a copy of the current Observation window screenshot, logical observation identity and goal, plus cancellation. Its model identity and strict passed/failed/unverifiable response are validated. The result records the model and screenshot ArtifactRef with the Observation; missing, stale, cancelled or malformed evaluation is unverifiable. No model service, credential, upload destination or background evaluation is inferred.
