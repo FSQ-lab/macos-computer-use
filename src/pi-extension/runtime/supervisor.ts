@@ -130,7 +130,6 @@ export class PiTaskSupervisor {
 
   async start(
     application: Extract<TaskOperationInput, { type: "begin" }>["application"],
-    finalAssertions: Extract<TaskOperationInput, { type: "begin" }>["finalAssertions"],
   ): Promise<TaskValue> {
     if (this.#child || this.#closed) throw new Error("This task supervisor cannot be started again.");
     this.#child = this.spawnRunner(this.configPath, this.cwd);
@@ -142,7 +141,7 @@ export class PiTaskSupervisor {
     }, 1_000);
     this.#heartbeat.unref();
     try {
-      return await this.#transmit({ type: "begin", application, finalAssertions });
+      return await this.#transmit({ type: "begin", application });
     } catch (error) {
       if (!this.#shutdownInProgress)
         this.#close(error instanceof Error ? error : new Error("Pi task failed to start."));

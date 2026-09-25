@@ -19,7 +19,12 @@ class FakeChild extends EventEmitter {
   readonly sent: TaskRequest[] = [];
   responseFor: (request: TaskRequest) => unknown = (request) => {
     const values: Record<TaskRequest["type"], TaskValue> = {
-      begin: { kind: "begun", leaseId: "lease-00000001" },
+      begin: {
+        kind: "begun",
+        leaseId: "lease-00000001",
+        observationId: "observation-00000001" as never,
+        compact: "button Save",
+      },
       heartbeat: { kind: "heartbeat", alive: true },
       observe: {
         kind: "observation",
@@ -28,12 +33,17 @@ class FakeChild extends EventEmitter {
       },
       query: {
         kind: "query",
+        status: "unique",
+        observationId: "observation-00000001" as never,
+        count: 1,
+        candidates: [{ elementId: "element-00000001" as never, role: "button" }],
         element: { elementId: "element-00000001" as never, role: "button" },
       },
       expand: {
         kind: "expanded",
         element: { elementId: "element-00000001" as never, role: "button" },
       },
+      freezeAssertions: { kind: "assertionsFrozen", count: 1 },
       action: {
         kind: "action",
         result: {
@@ -107,14 +117,13 @@ class FakeChild extends EventEmitter {
   }
 }
 
-const finalAssertions = [{ kind: "visible" as const, query: { role: "button" } }];
 const application = { name: "Fixture" };
 
 describe("PiTaskSupervisor", () => {
   it("serializes caller operations through one FIFO", async () => {
     const child = new FakeChild();
     const supervisor = new PiTaskSupervisor("/config.json", "/workspace", (() => child) as SpawnPiTaskRunner);
-    await supervisor.start(application, finalAssertions);
+    await supervisor.start(application);
     const first = supervisor.request({ type: "observe" });
     const second = supervisor.request({ type: "status" });
     await Promise.all([first, second]);
@@ -128,7 +137,7 @@ describe("PiTaskSupervisor", () => {
   it("terminates supervision when a child response violates identity or sequence", async () => {
     const child = new FakeChild();
     const supervisor = new PiTaskSupervisor("/config.json", "/workspace", (() => child) as SpawnPiTaskRunner);
-    await supervisor.start(application, finalAssertions);
+    await supervisor.start(application);
     child.responseFor = (request) => {
       const valid = new FakeChild().responseFor(request);
       if (typeof valid !== "object" || valid === null) throw new Error("Invalid fake response.");
@@ -144,7 +153,7 @@ describe("PiTaskSupervisor", () => {
   it("rejects pending and future work when the child disconnects", async () => {
     const child = new FakeChild();
     const supervisor = new PiTaskSupervisor("/config.json", "/workspace", (() => child) as SpawnPiTaskRunner);
-    await supervisor.start(application, finalAssertions);
+    await supervisor.start(application);
     child.send = () => true;
     const pending = supervisor.request({ type: "observe" });
     await new Promise((resolve) => setImmediate(resolve));
@@ -157,7 +166,7 @@ describe("PiTaskSupervisor", () => {
   it("closes after finish without sending a second abort", async () => {
     const child = new FakeChild();
     const supervisor = new PiTaskSupervisor("/config.json", "/workspace", (() => child) as SpawnPiTaskRunner);
-    await supervisor.start(application, finalAssertions);
+    await supervisor.start(application);
     await supervisor.request({ type: "finish" });
     await supervisor.shutdown("already finished");
     expect(child.sent.map((request) => request.type)).toEqual(["begin", "finish"]);
@@ -168,7 +177,7 @@ describe("PiTaskSupervisor", () => {
     const child = new FakeChild();
     child.holdBegin = true;
     const supervisor = new PiTaskSupervisor("/config.json", "/workspace", (() => child) as SpawnPiTaskRunner);
-    const starting = supervisor.start(application, finalAssertions);
+    const starting = supervisor.start(application);
     await new Promise((resolve) => setTimeout(resolve, 2_100));
     expect(child.sent.map((request) => request.type)).toEqual(["begin", "heartbeat", "heartbeat"]);
     child.releaseBegin();
@@ -184,7 +193,7 @@ describe("PiTaskSupervisor", () => {
       (() => child) as SpawnPiTaskRunner,
       10,
     );
-    await supervisor.start(application, finalAssertions);
+    await supervisor.start(application);
     child.send = (message) => {
       child.sent.push(message as TaskRequest);
       return true;
@@ -203,7 +212,7 @@ describe("PiTaskSupervisor", () => {
       (() => child) as SpawnPiTaskRunner,
       100,
     );
-    const starting = supervisor.start(application, finalAssertions);
+    const starting = supervisor.start(application);
     await new Promise((resolve) => setImmediate(resolve));
     let abortRequest: TaskRequest | undefined;
     child.send = (message, callback) => {

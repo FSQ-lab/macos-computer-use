@@ -14,12 +14,12 @@ Own the package's Public Client API and sole production composition root. Client
 
 The package public export provides `createMacOSComputerUseClient(config)` and public Contract types/schemas. The client exposes:
 
-- existing structured `run(options, callback)` lifecycle for configured-AUT callers, plus an internal Pi-run entry that supplies ApplicationTarget and final assertions;
+- existing structured `run(options, callback)` lifecycle for configured-AUT callers, plus an internal Pi-run entry that supplies ApplicationTarget, returns the initial Observation, and exposes one runner-only assertion-freeze operation;
 - Run-scope `observe`, compact/query/expand, and typed action/assertion operations;
 - read-only Run list/show and Evidence export operations;
 - explicit recovery and doctor application operations used by CLI.
 
-Existing public `run` and `runScenario` retain configured-AUT behavior. The private Pi runner invokes a Client application-target entry that validates ApplicationTarget, then follows the same lock, recovery, allocation, readiness, callback, finalization, Evidence, and cleanup lifecycle while overriding only the selected AUT identity for that Run. Pi performs the interactive target confirmation before calling Client. A closed handle returns `RunClosed`. Client and Pi never expose resolved bundle ID or application path.
+Existing public `run` and `runScenario` retain configured-AUT behavior. The private Pi runner invokes a Client application-target entry that validates ApplicationTarget, then follows the same lock, recovery, allocation, readiness, callback, finalization, Evidence, and cleanup lifecycle while overriding only the selected AUT identity and using the one-time post-readiness assertion freeze for that Run. Pi performs the interactive target confirmation before calling Client. A closed handle returns `RunClosed`. Client and Pi never expose resolved bundle ID or application path.
 
 ## Composition Root
 

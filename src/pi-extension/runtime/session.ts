@@ -191,16 +191,31 @@ export class PiTaskSession {
       });
     }
     if (request.type === "query") {
-      const element = this.#resolve(request.query);
-      if ("code" in element) return this.#failure(request, element);
-      const expanded = run.expand(element.elementId);
-      if (!expanded.ok) return this.#failure(request, clientFailure(expanded.error));
-      return this.#success(request, { kind: "query", element: safeElement(expanded.value) });
+      const page = run.queryPage(request.query, { limit: 100 });
+      if (!page.ok) return this.#failure(request, clientFailure(page.error));
+      const element = page.value.reference ? run.expand(page.value.reference.elementId) : undefined;
+      if (element && !element.ok) return this.#failure(request, clientFailure(element.error));
+      return this.#success(request, {
+        kind: "query",
+        status: page.value.status,
+        observationId: page.value.observationId,
+        count: page.value.count,
+        candidates: page.value.candidates.map(safeElement),
+        ...(element?.ok ? { element: safeElement(element.value) } : {}),
+      });
     }
     if (request.type === "expand") {
       const expanded = run.expand(request.elementId);
       if (!expanded.ok) return this.#failure(request, clientFailure(expanded.error));
       return this.#success(request, { kind: "expanded", element: safeElement(expanded.value) });
+    }
+    if (request.type === "freezeAssertions") {
+      if (this.#finalAssertions.length > 0)
+        return this.#failure(request, runtimeError("TaskState", "Final assertions are already frozen."));
+      const frozen = await run.freezeFinalAssertions(request.assertions);
+      if (!frozen.ok) return this.#failure(request, clientFailure(frozen.error));
+      this.#finalAssertions = request.assertions;
+      return this.#success(request, { kind: "assertionsFrozen", count: request.assertions.length });
     }
     if (request.type === "action") {
       const materialized = this.#materialize(request.target, request.action);
@@ -211,7 +226,11 @@ export class PiTaskSession {
         return this.#failure(request, clientFailure(action.error));
       }
       if (action.value.failure) {
-        this.#state = "finalizing";
+        if (
+          action.value.failure.dispatch !== "notDispatched" ||
+          !["TargetNotFound", "TargetAmbiguous", "SnapshotIncomplete"].includes(action.value.failure.code)
+        )
+          this.#state = "finalizing";
         return this.#failure(request, clientFailure(action.value.failure));
       }
       if (this.#isRevoked())
@@ -267,6 +286,11 @@ export class PiTaskSession {
     }
     if (request.type === "status") return this.#success(request, { kind: "status", state: this.#state });
 
+    if (this.#finalAssertions.length === 0)
+      return this.#failure(
+        request,
+        runtimeError("TaskState", "Freeze final assertions before normal finish."),
+      );
     this.#state = "finalizing";
     this.#completion?.resolve();
     const result = await this.#runPromise;
@@ -284,7 +308,7 @@ export class PiTaskSession {
 
   async #begin(request: Extract<TaskRequest, { type: "begin" }>): Promise<TaskResponse> {
     this.#taskId = request.taskId;
-    this.#finalAssertions = request.finalAssertions;
+    this.#finalAssertions = [];
     this.#runController = new AbortController();
     const recovery = await this.client.recover({ signal: this.#runController.signal });
     if (this.#state === "revoked")
@@ -306,7 +330,7 @@ export class PiTaskSession {
     this.#runPromise = this.client.runForApplication(
       request.application,
       {
-        finalAssertions: request.finalAssertions,
+        finalAssertions: [],
         signal: this.#runController.signal,
       },
       async (run) => {
@@ -328,7 +352,16 @@ export class PiTaskSession {
         return this.#failure(request, runtimeError("SupervisionLost", "Task authority was revoked."));
       this.#state = "active";
       this.#lastHeartbeat = this.now();
-      return this.#success(request, { kind: "begun", leaseId: run.leaseId });
+      const initial = run.currentObservation();
+      if (!initial.ok) return this.#failure(request, clientFailure(initial.error));
+      const refreshedCompact = run.compact();
+      if (!refreshedCompact.ok) return this.#failure(request, clientFailure(refreshedCompact.error));
+      return this.#success(request, {
+        kind: "begun",
+        leaseId: run.leaseId,
+        observationId: initial.value.observationId,
+        compact: refreshedCompact.value,
+      });
     } catch (error) {
       this.#state = "revoked";
       return this.#failure(

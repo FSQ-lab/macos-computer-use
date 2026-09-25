@@ -1,5 +1,6 @@
 import {
   HookContributionsSchema,
+  AssertionSpecSchema,
   AssertionResultSchema,
   type AssertionResult,
   ConfigSnapshotSchema,
@@ -79,9 +80,11 @@ export type GatewayDependencies = {
 };
 export type InteractiveRun = {
   readonly leaseId: LeaseId;
+  currentObservation(): OperationResult<Observation>;
   observe(): Promise<OperationResult<Observation>>;
   assert(assertion: AssertionSpec): Promise<OperationResult<AssertionResult>>;
   assertCurrent(assertion: AssertionSpec): Promise<OperationResult<AssertionResult>>;
+  freezeFinalAssertions(assertions: readonly AssertionSpec[]): Promise<OperationResult<{ frozen: true }>>;
   query(query: ElementQuery): OperationResult<ElementRef>;
   queryPage(query: ElementQuery, options?: { offset?: number; limit?: number }): OperationResult<QueryPage>;
   compact(): OperationResult<string>;
@@ -515,6 +518,7 @@ export class Gateway {
               sessionId: observation.sessionId,
               windowId: observation.windowId,
               expectedObservationId: observation.observationId,
+              beforeObservation: observation,
               deadlineMs: startedMono + config.timeouts.runTotalMs,
               readyUntilMs: Math.min(
                 environment.lease.expiresAtMs,
@@ -843,6 +847,7 @@ export class Gateway {
       );
       const leaseId = environment.lease.id;
       let observation: Observation | undefined;
+      let assertionsFrozen = finalAssertions.length > 0;
       const artifacts: ArtifactDescriptor[] = [];
       let evidenceDeadline: number | undefined;
       const evidenceRemaining = (): number =>
@@ -1148,6 +1153,54 @@ export class Gateway {
           });
         const run: InteractiveRun = {
           leaseId,
+          currentObservation: () =>
+            observation
+              ? ok(structuredClone(observation))
+              : err({
+                  code: "SnapshotIncomplete",
+                  phase: "observe",
+                  message: "Initial Observation is unavailable.",
+                  retryDisposition: "safe",
+                }),
+          freezeFinalAssertions: async (assertions) => {
+            if (closed)
+              return err({
+                code: "RunClosed",
+                phase: "action",
+                message: "Run scope is closed.",
+                retryDisposition: "notApplicable",
+              });
+            if (assertionsFrozen)
+              return err({
+                code: "InvalidScenario",
+                phase: "action",
+                message: "Final assertions are already frozen.",
+                retryDisposition: "notApplicable",
+              });
+            const parsed = assertions.map((assertion) => AssertionSpecSchema.safeParse(assertion));
+            if (parsed.length === 0 || parsed.some((item) => !item.success) || !observation)
+              return err({
+                code: "InvalidScenario",
+                phase: "action",
+                message: "Final assertions require a current Observation and valid nonempty input.",
+                retryDisposition: "safe",
+              });
+            const frozen = parsed.flatMap((item) => (item.success ? [item.data] : []));
+            const recorded = await append("FinalAssertionsFrozen", {
+              count: frozen.length,
+              observationId: observation.observationId,
+            });
+            if (!recorded)
+              return err({
+                code: "EvidenceIncomplete",
+                phase: "evidence",
+                message: "Final assertion freeze Evidence could not be committed.",
+                retryDisposition: "notApplicable",
+              });
+            finalAssertions = structuredClone(frozen);
+            assertionsFrozen = true;
+            return ok({ frozen: true as const });
+          },
           queryPage: (query, options) => {
             if (closed)
               return err({
@@ -1596,6 +1649,7 @@ export class Gateway {
                   sessionId: observation.sessionId,
                   windowId: observation.windowId,
                   expectedObservationId: observation.observationId,
+                  beforeObservation: observation,
                   deadlineMs: startedMono + config.timeouts.runTotalMs,
                   readyUntilMs: application
                     ? environment.lease.expiresAtMs
@@ -1642,6 +1696,7 @@ export class Gateway {
         environment.beginCleanup();
         if (
           ((current: Observation | undefined) => current === undefined)(observation) ||
+          !assertionsFrozen ||
           finalAssertions.length === 0
         )
           verdict = "inconclusive";

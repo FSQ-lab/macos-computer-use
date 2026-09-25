@@ -48,7 +48,7 @@ Artifact descriptors contain type, relative path, MIME, byte size, SHA-256, and 
 
 A Manifest revision deterministically records Run/build/schema/config/environment/result, event count, complete timeline SHA-256, and Artifact descriptors. Commit uses the Artifact-style atomic/fsync procedure. Normal Run finalization stops ordinary event appends; recovery may append recovery events and create a higher immutable Manifest revision while preserving prior revisions.
 
-Effective configuration and environment snapshots remain strictly validated version 2 records in this increment. Pi-selected application identity and fixed shared-network facts are not added to new snapshot schemas yet. Existing snapshots, timeline, action/assertion Evidence, final result, and cleanup records remain unchanged and mandatory.
+Effective configuration and environment snapshots remain strictly validated version 2 records in this increment. Pi-selected application identity and fixed shared-network facts are not added to new snapshot schemas yet. The timeline adds `FinalAssertionsFrozen` with only assertion count and Observation ID; it does not duplicate assertion text. Existing snapshots, action/assertion Evidence, final result, and cleanup records remain unchanged and mandatory.
 
 Read/show/export verifies Manifest, timeline, Artifact hashes, sizes, relative paths, and schema versions. Mismatch returns `EvidenceCorrupted`. SHA-256 detects accidental integrity loss but is not represented as a signature or malicious-tamper defense.
 

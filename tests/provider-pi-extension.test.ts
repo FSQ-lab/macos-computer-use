@@ -56,7 +56,7 @@ describe.skipIf(!configPath || profile !== "pi-fail-dead")("Pi Extension fail-de
     const isolated = await isolatedConfig();
     try {
       const supervisor = new PiTaskSupervisor(isolated.path, process.cwd());
-      await supervisor.start(application, finalAssertions);
+      await supervisor.start(application);
       const result = await supervisor.request({ type: "finish" });
       expect(result).toMatchObject({
         kind: "finished",
@@ -104,7 +104,7 @@ describe.skipIf(!configPath || profile !== "pi-fail-dead")("Pi Extension fail-de
     parent.kill("SIGKILL");
 
     const next = new PiTaskSupervisor(isolated.path, process.cwd());
-    await next.start(application, finalAssertions);
+    await next.start(application);
     const during = await managed();
     expect(during).toHaveLength(1);
     expect(during[0]?.Name).not.toBe(before[0]?.Name);
@@ -143,13 +143,14 @@ describe.skipIf(!configPath || profile !== "pi-uat-fix")("Pi Extension UAT fixes
       const begin = tools.get("macos_begin");
       const observe = tools.get("macos_observe");
       const action = tools.get("macos_action");
+      const freeze = tools.get("macos_freeze_assertions");
       const finish = tools.get("macos_finish");
-      if (!begin || !observe || !action || !finish) throw new Error("Pi tools unavailable.");
-      await begin.execute(
-        "begin",
+      if (!begin || !observe || !action || !freeze || !finish) throw new Error("Pi tools unavailable.");
+      await begin.execute("begin", { application }, undefined, undefined, context);
+      await freeze.execute(
+        "freeze",
         {
-          application,
-          finalAssertions: [
+          assertions: [
             {
               kind: "text",
               query: { identifier: "fixture.status" },
@@ -208,7 +209,10 @@ describe.skipIf(!configPath || profile !== "pi-uat-fix")("Pi Extension UAT fixes
       const begin = tools.get("macos_begin");
       const action = tools.get("macos_action");
       if (!begin || !action) throw new Error("Pi tools unavailable.");
-      await begin.execute("begin", { application, finalAssertions }, undefined, undefined, context);
+      await begin.execute("begin", { application }, undefined, undefined, context);
+      await tools
+        .get("macos_freeze_assertions")
+        ?.execute("freeze", { assertions: finalAssertions }, undefined, undefined, context);
       const terminal = await action.execute(
         "contradicted",
         {
@@ -251,15 +255,19 @@ describe.skipIf(!configPath || profile !== "pi-text-minimal")("Pi Extension text
     const isolated = await isolatedConfig();
     try {
       const supervisor = new PiTaskSupervisor(isolated.path, process.cwd());
-      await supervisor.start(application, [
-        {
-          kind: "value",
-          query: { identifier: "fixture.text-input" },
-          expected: "Alpha Beta",
-          match: "exact",
-        },
-        { kind: "state", query: { identifier: "fixture.checkbox" }, state: { selected: true } },
-      ]);
+      await supervisor.start(application);
+      await supervisor.request({
+        type: "freezeAssertions",
+        assertions: [
+          {
+            kind: "value",
+            query: { identifier: "fixture.text-input" },
+            expected: "Alpha Beta",
+            match: "exact",
+          },
+          { kind: "state", query: { identifier: "fixture.checkbox" }, state: { selected: true } },
+        ],
+      });
       await supervisor.request({ type: "observe" });
       const focused = await supervisor.request({
         type: "action",
@@ -317,72 +325,36 @@ describe.skipIf(!configPath || profile !== "pi-text-minimal")("Pi Extension text
 });
 
 describe.skipIf(!configPath || profile !== "pi-safari-input")("Pi Safari TodoMVC input", () => {
-  it("navigates, enters, and submits one web todo without replaying input", async () => {
+  it("executes the short two-task command with relationship queries", async () => {
     const isolated = await isolatedConfig();
     let completed = false;
+    const tools = new Map<string, ToolDefinition>();
+    const context: ToolContext = {
+      cwd: process.cwd(),
+      mode: "tui",
+      hasUI: true,
+      ui: { confirm: async () => true, notify: () => undefined },
+    };
     try {
-      const tools = new Map<string, ToolDefinition>();
       const api: ExtensionAPI = {
         registerTool: (tool) => tools.set(tool.name, tool),
         registerCommand: () => undefined,
         on: (() => () => undefined) as ExtensionAPI["on"],
       };
       createPiExtension({ configPath: isolated.path, registerProcessSignal: () => () => undefined })(api);
-      const context: ToolContext = {
-        cwd: process.cwd(),
-        mode: "tui",
-        hasUI: true,
-        ui: { confirm: async () => true, notify: () => undefined },
-      };
       const begin = tools.get("macos_begin");
       const observe = tools.get("macos_observe");
       const query = tools.get("macos_query");
       const action = tools.get("macos_action");
+      const freeze = tools.get("macos_freeze_assertions");
       const finish = tools.get("macos_finish");
-      if (!begin || !observe || !query || !action || !finish) throw new Error("Pi tools unavailable.");
-      await begin.execute(
-        "begin",
-        {
-          application: { name: "Safari" },
-          finalAssertions: [
-            {
-              kind: "value",
-              query: { role: "group", value: { exact: "Review FSQ evidence" } },
-              expected: "Review FSQ evidence",
-              match: "exact",
-            },
-          ],
-        },
-        undefined,
-        undefined,
-        context,
-      );
-      await observe.execute("observe", {}, undefined, undefined, context);
+      if (!begin || !observe || !query || !action || !freeze || !finish)
+        throw new Error("Pi tools unavailable.");
+      await begin.execute("begin", { application: { name: "Safari" } }, undefined, undefined, context);
       await action.execute(
         "focus-address",
         {
-          target: { identifier: "WEB_BROWSER_ADDRESS_AND_SEARCH_FIELD" },
-          action: { kind: "click" },
-          assertions: [],
-        },
-        undefined,
-        undefined,
-        context,
-      );
-      await action.execute(
-        "select-address",
-        {
-          action: { kind: "pressKey", key: "a", modifiers: ["command"] },
-          assertions: [],
-        },
-        undefined,
-        undefined,
-        context,
-      );
-      await action.execute(
-        "clear-address",
-        {
-          action: { kind: "pressKey", key: "backspace" },
+          action: { kind: "pressKey", key: "l", modifiers: ["command"] },
           assertions: [],
         },
         undefined,
@@ -411,8 +383,10 @@ describe.skipIf(!configPath || profile !== "pi-safari-input")("Pi Safari TodoMVC
       );
       let inputReady = false;
       for (let attempt = 0; attempt < 10 && !inputReady; attempt += 1) {
-        inputReady = await observe
-          .execute("poll-observe", {}, undefined, undefined, context)
+        inputReady = await query
+          .execute("wait", { query: { role: "window" } }, undefined, undefined, context)
+          .then(() => new Promise<void>((resolve) => setTimeout(resolve, 1_000)))
+          .then(() => observe.execute("poll-observe", {}, undefined, undefined, context))
           .then(() =>
             query.execute(
               "poll-query",
@@ -422,11 +396,39 @@ describe.skipIf(!configPath || profile !== "pi-safari-input")("Pi Safari TodoMVC
               context,
             ),
           )
-          .then(() => true)
+          .then((result) => (result.details as { status?: unknown }).status === "unique")
           .catch(() => false);
         if (!inputReady) await new Promise<void>((resolve) => setTimeout(resolve, 1_000));
       }
       expect(inputReady).toBe(true);
+      await freeze.execute(
+        "freeze",
+        {
+          assertions: [
+            {
+              kind: "value",
+              query: {
+                role: "group",
+                value: { exact: "Publish v0.1.0" },
+                descendant: { role: "checkbox" },
+              },
+              expected: "Publish v0.1.0",
+              match: "exact",
+            },
+            {
+              kind: "notVisible",
+              query: {
+                role: "group",
+                value: { exact: "Review FSQ evidence" },
+                descendant: { role: "checkbox" },
+              },
+            },
+          ],
+        },
+        undefined,
+        undefined,
+        context,
+      );
       const entered = await action.execute(
         "focus-todo",
         {
@@ -456,8 +458,8 @@ describe.skipIf(!configPath || profile !== "pi-safari-input")("Pi Safari TodoMVC
         kind: "action",
         result: { dispatch: "dispatched", providerOutcome: "succeeded" },
       });
-      const submitted = await action.execute(
-        "submit",
+      await action.execute(
+        "submit-review",
         {
           action: { kind: "pressKey", key: "enter" },
           assertions: [],
@@ -466,23 +468,59 @@ describe.skipIf(!configPath || profile !== "pi-safari-input")("Pi Safari TodoMVC
         undefined,
         context,
       );
-      expect(submitted.details).toMatchObject({
+      await action.execute(
+        "type-publish",
+        { action: { kind: "typeText", value: { literal: "Publish v0.1.0" } }, assertions: [] },
+        undefined,
+        undefined,
+        context,
+      );
+      await action.execute(
+        "submit-publish",
+        { action: { kind: "pressKey", key: "enter" }, assertions: [] },
+        undefined,
+        undefined,
+        context,
+      );
+      const firstCheckbox = {
+        role: "checkbox",
+        ancestor: { role: "group", value: { exact: "Review FSQ evidence" } },
+      };
+      const checkboxQuery = await query.execute(
+        "query-first-checkbox",
+        { query: firstCheckbox },
+        undefined,
+        undefined,
+        context,
+      );
+      expect(checkboxQuery.details).toMatchObject({ kind: "query", status: "unique", count: 1 });
+      await action.execute(
+        "complete-first",
+        { target: firstCheckbox, action: { kind: "click" }, assertions: [] },
+        undefined,
+        undefined,
+        context,
+      );
+      const activeQuery = await query.execute(
+        "query-active",
+        { query: { role: "link", name: { exact: "Active" } } },
+        undefined,
+        undefined,
+        context,
+      );
+      expect(activeQuery.details).toMatchObject({ kind: "query", status: "unique", count: 1 });
+      const filtered = await action.execute(
+        "filter-active",
+        { target: { role: "link", name: { exact: "Active" } }, action: { kind: "click" }, assertions: [] },
+        undefined,
+        undefined,
+        context,
+      );
+      expect(filtered.details).toMatchObject({
         kind: "action",
-        result: { dispatch: "dispatched", providerOutcome: "succeeded", verification: "notRequested" },
+        result: { dispatch: "dispatched", providerOutcome: "succeeded" },
         completionReady: true,
       });
-      await expect(
-        action.execute(
-          "extra",
-          {
-            target: { role: "group", value: { exact: "Review FSQ evidence" } },
-            action: { kind: "doubleClick" },
-          },
-          undefined,
-          undefined,
-          context,
-        ),
-      ).rejects.toThrow("extra exploration");
       const finished = await finish.execute("finish", {}, undefined, undefined, context);
       expect(finished.details).toMatchObject({
         kind: "finished",
@@ -504,6 +542,13 @@ describe.skipIf(!configPath || profile !== "pi-safari-input")("Pi Safari TodoMVC
       expect(await managed()).toEqual([]);
       completed = true;
     } finally {
+      if (!completed) {
+        const abort = tools.get("macos_abort");
+        if (abort)
+          await abort
+            .execute("uat-failure", { reason: "UAT assertion failed" }, undefined, undefined, context)
+            .catch(() => undefined);
+      }
       await waitForNoManagedClone();
       if (completed) await isolated.cleanup();
       else process.stderr.write(`SAFARI_UAT_DIR=${isolated.path.slice(0, isolated.path.lastIndexOf("/"))}\n`);

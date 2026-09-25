@@ -23,12 +23,16 @@ class FakeSupervisor implements PiTaskSupervisor {
 
   async start(
     application: Extract<TaskOperationInput, { type: "begin" }>["application"],
-    finalAssertions: Extract<TaskOperationInput, { type: "begin" }>["finalAssertions"],
   ): Promise<TaskValue> {
-    this.requests.push({ type: "begin", application, finalAssertions });
+    this.requests.push({ type: "begin", application });
     if (this.structuredStartFailure)
       throw new PiTaskRequestError({ code: "ClientFailure", message: "RecoveryRequired: dirty" });
-    return { kind: "begun", leaseId: "lease-00000001" };
+    return {
+      kind: "begun",
+      leaseId: "lease-00000001",
+      observationId: "observation-00000001" as never,
+      compact: '[element-00000001] button "Save" id="fixture.save" depth=0 enabled',
+    };
   }
 
   async request(input: Exclude<TaskOperationInput, { type: "begin" | "heartbeat" }>): Promise<TaskValue> {
@@ -68,12 +72,24 @@ class FakeSupervisor implements PiTaskSupervisor {
     if (input.type === "query")
       return {
         kind: "query",
+        status: "unique",
+        observationId: "observation-00000001" as never,
+        count: 1,
+        candidates: [
+          {
+            elementId: "element-00000001" as never,
+            role: input.query.role ?? "button",
+            ...(input.query.identifier ? { identifier: input.query.identifier } : {}),
+          },
+        ],
         element: {
           elementId: "element-00000001" as never,
           role: input.query.role ?? "button",
           ...(input.query.identifier ? { identifier: input.query.identifier } : {}),
         },
       };
+    if (input.type === "freezeAssertions")
+      return { kind: "assertionsFrozen", count: input.assertions.length };
     if (input.type === "expand")
       return {
         kind: "expanded",
@@ -186,16 +202,16 @@ const setup = (confirm = true) => {
 const begin = async (state: ReturnType<typeof setup>): Promise<void> => {
   const tool = state.tools.get("macos_begin");
   if (!tool) throw new Error("begin tool missing");
-  await tool.execute(
-    "begin",
-    {
-      application: { name: "Fixture" },
-      finalAssertions: [{ kind: "visible", query: { role: "button" } }],
-    },
-    undefined,
-    undefined,
-    state.context,
-  );
+  await tool.execute("begin", { application: { name: "Fixture" } }, undefined, undefined, state.context);
+  await state.tools
+    .get("macos_freeze_assertions")
+    ?.execute(
+      "freeze",
+      { assertions: [{ kind: "visible", query: { role: "button" } }] },
+      undefined,
+      undefined,
+      state.context,
+    );
 };
 
 describe("Pi extension", () => {
@@ -206,6 +222,7 @@ describe("Pi extension", () => {
       "macos_observe",
       "macos_query",
       "macos_expand",
+      "macos_freeze_assertions",
       "macos_action",
       "macos_assert",
       "macos_finish",
@@ -218,9 +235,10 @@ describe("Pi extension", () => {
   it("publishes exact discriminated assertion and action schemas to the model", () => {
     const state = setup();
     const beginSchema = JSON.stringify(state.tools.get("macos_begin")?.parameters);
+    const freezeSchema = JSON.stringify(state.tools.get("macos_freeze_assertions")?.parameters);
     const actionSchema = JSON.stringify(state.tools.get("macos_action")?.parameters);
     for (const kind of ["visible", "notVisible", "text", "value", "state", "elementOrder", "aiVisual"])
-      expect(beginSchema).toContain(`"const":"${kind}"`);
+      expect(freezeSchema).toContain(`"const":"${kind}"`);
     for (const kind of [
       "click",
       "doubleClick",
@@ -235,7 +253,7 @@ describe("Pi extension", () => {
       expect(actionSchema).toContain(kind);
     expect(actionSchema).not.toContain("appendText");
     expect(actionSchema).not.toContain("replaceText");
-    expect(beginSchema).toContain("identifier");
+    expect(freezeSchema).toContain("identifier");
     expect(beginSchema).toContain("application");
     expect(actionSchema).toContain("destination");
     expect(actionSchema).toContain('"confirm":{"type":"boolean","const":true}');
@@ -267,7 +285,6 @@ describe("Pi extension", () => {
         "begin",
         {
           application: { name: "Safari" },
-          finalAssertions: [{ kind: "visible", query: { role: "window" } }],
         },
         undefined,
         undefined,
@@ -285,19 +302,51 @@ describe("Pi extension", () => {
       "macos_observe",
       "macos_query",
       "macos_expand",
+      "macos_freeze_assertions",
       "macos_action",
       "macos_assert",
       "macos_finish",
       "macos_abort",
     ]);
     expect(prompt.promptGuidelines.join(" ")).toContain("Never use bash");
+    expect(prompt.promptGuidelines.join(" ")).toContain("sole goal authority");
+    expect(prompt.promptGuidelines.join(" ")).toContain("macos_freeze_assertions exactly once");
+    expect(prompt.promptGuidelines.join(" ")).toContain("ancestor");
+    expect(prompt.promptGuidelines.join(" ")).toContain("status=unique");
     await expect(state.toolCall("bash")).resolves.toMatchObject({ block: true, terminate: false });
     await expect(state.toolCall("third_party_tool")).resolves.toMatchObject({
       block: true,
       terminate: false,
     });
-    state.toolCall("macos_begin", { application: { name: "Fixture" }, finalAssertions: [] });
+    state.toolCall("macos_begin", { application: { name: "Fixture" } });
     await expect(state.toolCall("read")).resolves.toMatchObject({ block: true, terminate: true });
+  });
+
+  it("rejects Tab exploration unless the user explicitly requested Tab", async () => {
+    const state = setup();
+    state.beforeAgentStart("Open Safari and complete the task");
+    await begin(state);
+    const action = state.tools.get("macos_action");
+    if (!action) throw new Error("action tool missing");
+    await expect(
+      action.execute(
+        "tab",
+        { action: { kind: "pressKey", key: "tab" } },
+        undefined,
+        undefined,
+        state.context,
+      ),
+    ).rejects.toThrow("Tab focus traversal");
+    state.beforeAgentStart("Press the Tab key once");
+    await expect(
+      action.execute(
+        "explicit-tab",
+        { action: { kind: "pressKey", key: "tab" } },
+        undefined,
+        undefined,
+        state.context,
+      ),
+    ).resolves.toBeTruthy();
   });
 
   it("runs ordinary actions without confirmation and confirms only explicitly flagged actions", async () => {
@@ -320,7 +369,7 @@ describe("Pi extension", () => {
     await expect(
       action.execute(
         "denied",
-        { action: { kind: "pressKey", key: "tab" }, confirm: true },
+        { action: { kind: "pressKey", key: "enter" }, confirm: true },
         undefined,
         undefined,
         denied.context,
@@ -392,7 +441,6 @@ describe("Pi extension", () => {
         "restart",
         {
           application: { name: "Fixture" },
-          finalAssertions: [{ kind: "visible", query: { role: "button" } }],
         },
         undefined,
         undefined,
@@ -407,7 +455,6 @@ describe("Pi extension", () => {
         "next-turn",
         {
           application: { name: "Fixture" },
-          finalAssertions: [{ kind: "visible", query: { role: "button" } }],
         },
         undefined,
         undefined,
@@ -454,7 +501,6 @@ describe("Pi extension", () => {
       "begin",
       {
         application: { name: "Fixture" },
-        finalAssertions: [{ kind: "visible", query: { role: "button" } }],
       },
       undefined,
       undefined,
@@ -488,7 +534,6 @@ describe("Pi extension", () => {
         "begin",
         {
           application: { name: "Safari" },
-          finalAssertions: [{ kind: "visible", query: { role: "window" } }],
         },
         undefined,
         undefined,
@@ -526,7 +571,6 @@ describe("Pi extension", () => {
         "same-turn-restart",
         {
           application: { name: "Fixture" },
-          finalAssertions: [{ kind: "visible", query: { role: "button" } }],
         },
         undefined,
         undefined,
@@ -614,7 +658,6 @@ describe("Pi extension", () => {
         "same-turn-restart",
         {
           application: { name: "Fixture" },
-          finalAssertions: [{ kind: "visible", query: { role: "button" } }],
         },
         undefined,
         undefined,
@@ -664,7 +707,6 @@ describe("Pi extension", () => {
         "again",
         {
           application: { name: "Fixture" },
-          finalAssertions: [{ kind: "visible", query: { role: "button" } }],
         },
         undefined,
         undefined,
@@ -794,11 +836,72 @@ describe("Pi extension", () => {
         state.context,
       ),
     ).rejects.toThrow("refine macos_query");
+    await state.tools
+      .get("macos_query")
+      ?.execute(
+        "premature-refine",
+        { query: { identifier: "fixture.save" } },
+        undefined,
+        undefined,
+        state.context,
+      );
+    await expect(
+      action.execute(
+        "blocked-without-observe",
+        { target: { identifier: "fixture.save" }, action: { kind: "click" } },
+        undefined,
+        undefined,
+        state.context,
+      ),
+    ).rejects.toThrow("refine macos_query");
     await observe.execute("recover", {}, undefined, undefined, state.context);
+    await expect(
+      action.execute(
+        "still-blocked",
+        { target: { identifier: "fixture.save" }, action: { kind: "click" } },
+        undefined,
+        undefined,
+        state.context,
+      ),
+    ).rejects.toThrow("refine macos_query");
+    await state.tools
+      .get("macos_query")
+      ?.execute("refine", { query: { identifier: "fixture.save" } }, undefined, undefined, state.context);
     await expect(
       action.execute(
         "allowed",
         { target: { identifier: "fixture.save" }, action: { kind: "click" } },
+        undefined,
+        undefined,
+        state.context,
+      ),
+    ).resolves.toBeTruthy();
+  });
+
+  it("requires exact relationship-query provenance before relationship actions", async () => {
+    const state = setup();
+    await begin(state);
+    const action = state.tools.get("macos_action");
+    const query = state.tools.get("macos_query");
+    if (!action || !query) throw new Error("tool missing");
+    const relationship = {
+      role: "checkbox",
+      ancestor: { role: "group", value: { exact: "Review FSQ evidence" } },
+    };
+    await expect(
+      action.execute(
+        "invented-relationship",
+        { target: relationship, action: { kind: "click" } },
+        undefined,
+        undefined,
+        state.context,
+      ),
+    ).rejects.toThrow("not proven");
+    await query.execute("relationship", { query: relationship }, undefined, undefined, state.context);
+    await expect(
+      action.execute(
+        "proven-relationship",
+        { target: relationship, action: { kind: "click" } },
         undefined,
         undefined,
         state.context,

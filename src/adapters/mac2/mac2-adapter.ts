@@ -18,6 +18,7 @@ import {
   type ElementId,
   type ElementRef,
   type ElementQuery,
+  type ElementSelector,
   type ElementSummary,
   type Observation,
   type OperationError,
@@ -64,6 +65,8 @@ type NativeLocator = {
   query?: ElementQuery;
   width?: number;
   height?: number;
+  x?: number;
+  y?: number;
 };
 const W3C_ELEMENT = "element-6066-11e4-a52e-4f735466cecf";
 const NEW_COMMAND_TIMEOUT_SECONDS = 3_000;
@@ -99,6 +102,7 @@ const xpathLiteral = (value: string): string =>
           .split("'")
           .map((part) => `'${part}'`)
           .join(`, "'", `)})`;
+const classChainLiteral = (value: string): string => JSON.stringify(value);
 
 export class Mac2DesktopAdapter implements DesktopPort {
   constructor(
@@ -338,17 +342,11 @@ export class Mac2DesktopAdapter implements DesktopPort {
     let dispatchedTextCodePoints = 0;
     try {
       this.#validateActionContext(action);
-      stage = "foreground";
-      await this.#requireForeground(signal);
-      stage = "pageSource";
-      const source = await this.#pageSource(signal);
-      if (
-        typeof source.value !== "string" ||
-        !this.#windowQuery ||
-        !this.#windowMatches(source.value, this.#windowQuery)
-      )
-        throw new Error("not foreground");
       if (action.kind === "pressKey") {
+        stage = "foreground";
+        await this.#requireForeground(signal);
+        stage = "windowResolution";
+        await this.#resolveWindow(this.#windowQuery, signal);
         stage = "keyDispatch";
         await this.#execute(
           "macos: keys",
@@ -356,6 +354,10 @@ export class Mac2DesktopAdapter implements DesktopPort {
           signal,
         );
       } else if (action.kind === "typeText") {
+        stage = "foreground";
+        await this.#requireForeground(signal);
+        stage = "windowResolution";
+        await this.#resolveWindow(this.#windowQuery, signal);
         const text = "literal" in action.value ? action.value.literal : undefined;
         if (text === undefined)
           return err({
@@ -383,6 +385,11 @@ export class Mac2DesktopAdapter implements DesktopPort {
       } else {
         if (!("element" in action.target)) throw new Error("invalid target");
         const ref = action.target.element;
+        stage = "foreground";
+        await this.#requireForeground(signal);
+        stage = "windowResolution";
+        await this.#resolveWindow(this.#windowQuery, signal);
+        stage = "targetResolution";
         const elementId = await this.#resolve(ref, signal);
         const point = action.target.point ?? { x: 0.5, y: 0.5 };
         const locator = await this.#currentSize(elementId, signal);
@@ -736,7 +743,9 @@ export class Mac2DesktopAdapter implements DesktopPort {
           e.identifier === undefined || e.identifier.length === 0
             ? ""
             : ` id=${JSON.stringify(e.identifier.slice(0, 500))}`;
-        return `[${e.elementId}] ${e.role} ${JSON.stringify(primary.slice(0, 120))}${identifier}${e.enabled === undefined ? "" : e.enabled ? " enabled" : " disabled"}`;
+        const depth = e.depth ?? 0;
+        const parent = e.parentElementId ? ` parent=${e.parentElementId}` : "";
+        return `${"  ".repeat(Math.min(depth, 32))}[${e.elementId}] ${e.role} ${JSON.stringify(primary.slice(0, 120))}${identifier}${parent} depth=${String(depth)}${e.enabled === undefined ? "" : e.enabled ? " enabled" : " disabled"}`;
       }),
       ...(observation.elements.length > 200
         ? [`... ${String(observation.elements.length - 200)} more elements`]
@@ -747,7 +756,7 @@ export class Mac2DesktopAdapter implements DesktopPort {
   query(observation: Observation, query: ElementQuery): OperationResult<ElementRef> {
     const source =
       this.#context?.observationId === observation.observationId ? this.#allElements : observation.elements;
-    const matches = source.filter((element) => this.#matches(element, query));
+    const matches = source.filter((element) => this.#matches(element, query, source));
     if (observation.coverage !== "complete")
       return err({
         code: "SnapshotIncomplete",
@@ -804,7 +813,7 @@ export class Mac2DesktopAdapter implements DesktopPort {
       });
     const current = this.#context?.observationId === observation.observationId;
     const source = current ? this.#allElements : observation.elements;
-    const matches = source.filter((element) => this.#matches(element, query));
+    const matches = source.filter((element) => this.#matches(element, query, source));
     const complete = current || observation.coverage === "complete";
     const resolved =
       complete && matches.length === 1
@@ -888,6 +897,29 @@ export class Mac2DesktopAdapter implements DesktopPort {
     if (!locator) throw new Error("stale");
     const using = "xpath";
     const predicates: string[] = [];
+    const query = locator.query;
+    const selectorPredicate = (selector: ElementSelector): string => {
+      const clauses: string[] = [];
+      if (selector.identifier) clauses.push(`@identifier=${xpathLiteral(selector.identifier)}`);
+      if (selector.name) clauses.push(this.#textXpath("@title", selector.name));
+      if (selector.label) clauses.push(this.#textXpath("@label", selector.label));
+      if (selector.value) clauses.push(this.#textXpath("@value", selector.value));
+      if (selector.state)
+        for (const [field, expected] of Object.entries(selector.state))
+          if (expected !== undefined) clauses.push(`@${field}=${xpathLiteral(String(expected))}`);
+      return clauses.join(" and ");
+    };
+    const nativeRoleFor = (selector: ElementSelector): string => {
+      if (!selector.role) return "*";
+      const roles = [
+        ...new Set(
+          this.#allElements
+            .filter((element) => element.role === selector.role)
+            .flatMap((element) => (element.nativeRole ? [element.nativeRole] : [])),
+        ),
+      ];
+      return roles.length === 1 ? (roles[0] as string) : "*";
+    };
     for (const field of ["identifier", "name", "title", "label", "value"] as const) {
       const expected = locator[field];
       if (expected !== undefined) predicates.push(`@${field}=${xpathLiteral(expected)}`);
@@ -896,13 +928,99 @@ export class Mac2DesktopAdapter implements DesktopPort {
       const expected = locator[field];
       if (expected !== undefined) predicates.push(`@${field}=${xpathLiteral(String(expected))}`);
     }
-    await this.#resolveWindow(this.#windowQuery, signal);
-    const value = `${this.#windowXpath(this.#windowQuery)}//${locator.role}${predicates.length ? `[${predicates.join(" and ")}]` : ""}`;
-    const response = await this.#sessionRequest("POST", "/elements", { using, value }, signal);
-    const elements = Array.isArray(response.value) ? response.value : [];
-    if (elements.length !== 1) throw new Error(elements.length === 0 ? "not found" : "ambiguous");
-    const item = asObject(elements[0]);
-    const id = typeof item?.[W3C_ELEMENT] === "string" ? item[W3C_ELEMENT] : undefined;
+    const idsFrom = (response: JsonObject): string[] =>
+      (Array.isArray(response.value) ? response.value : []).flatMap((item) => {
+        const id = asObject(item)?.[W3C_ELEMENT];
+        return typeof id === "string" ? [id] : [];
+      });
+    const find = async (path: string, value: string): Promise<string[]> =>
+      idsFrom(await this.#sessionRequest("POST", path, { using, value }, signal));
+    const targetPath = `${locator.role}${predicates.length ? `[${predicates.join(" and ")}]` : ""}`;
+    let candidateIds: string[];
+    if (!query?.ancestor && !query?.descendant) {
+      const clauses: string[] = [];
+      for (const field of ["identifier", "name", "title", "label", "value"] as const) {
+        const expected = locator[field];
+        if (expected !== undefined) clauses.push(`${field} == ${classChainLiteral(expected)}`);
+      }
+      for (const field of ["enabled", "selected", "focused"] as const) {
+        const expected = locator[field];
+        if (expected !== undefined) clauses.push(`${field} == ${expected ? "TRUE" : "FALSE"}`);
+      }
+      const windowClauses: string[] = [];
+      const window = this.#windowQuery;
+      if (!window) throw new Error("ambiguous window");
+      if (window.title) {
+        const field = window.title.caseSensitive ? "title" : "title";
+        const raw = "exact" in window.title ? window.title.exact : window.title.contains;
+        const operator = "exact" in window.title ? "==" : "CONTAINS";
+        const modifier = window.title.caseSensitive ? "" : "[c]";
+        windowClauses.push(`${field} ${operator}${modifier} ${classChainLiteral(raw)}`);
+      }
+      if (window.isMain === true) windowClauses.push("(main == TRUE OR focused == TRUE)");
+      if (window.isMain === false) windowClauses.push("main == FALSE AND focused == FALSE");
+      if (window.isModal !== undefined) windowClauses.push(`modal == ${window.isModal ? "TRUE" : "FALSE"}`);
+      candidateIds = idsFrom(
+        await this.#sessionRequest(
+          "POST",
+          "/elements",
+          {
+            using: "class chain",
+            value: `**/XCUIElementTypeWindow${windowClauses.length ? `[\`${windowClauses.join(" AND ")}\`]` : ""}/**/${locator.role}${clauses.length ? `[\`${clauses.join(" AND ")}\`]` : ""}`,
+          },
+          signal,
+        ),
+      );
+    } else if (query.ancestor) {
+      const relation = selectorPredicate(query.ancestor);
+      const role = nativeRoleFor(query.ancestor);
+      candidateIds = await find(
+        "/elements",
+        `${this.#windowXpath(this.#windowQuery)}//${role}${relation ? `[${relation}]` : ""}//${targetPath}`,
+      );
+    } else {
+      candidateIds = await find("/elements", `${this.#windowXpath(this.#windowQuery)}//${targetPath}`);
+    }
+    if (query?.descendant) {
+      const relation = selectorPredicate(query.descendant);
+      const role = nativeRoleFor(query.descendant);
+      const ancestorPrefix = query.ancestor
+        ? `//${nativeRoleFor(query.ancestor)}${selectorPredicate(query.ancestor) ? `[${selectorPredicate(query.ancestor)}]` : ""}`
+        : "";
+      candidateIds = await find(
+        "/elements",
+        `${this.#windowXpath(this.#windowQuery)}${ancestorPrefix}//${targetPath}[descendant::${role}${relation ? `[${relation}]` : ""}]`,
+      );
+    }
+    if (
+      candidateIds.length > 1 &&
+      [locator.x, locator.y, locator.width, locator.height].every(Number.isFinite)
+    ) {
+      const matching: string[] = [];
+      for (const candidateId of candidateIds.slice(0, 100)) {
+        const rect = asObject(
+          (
+            await this.#sessionRequest(
+              "GET",
+              `/element/${encodeURIComponent(candidateId)}/rect`,
+              undefined,
+              signal,
+            )
+          ).value,
+        );
+        if (
+          rect &&
+          Math.abs(Number(rect.x) - Number(locator.x)) < 0.5 &&
+          Math.abs(Number(rect.y) - Number(locator.y)) < 0.5 &&
+          Math.abs(Number(rect.width) - Number(locator.width)) < 0.5 &&
+          Math.abs(Number(rect.height) - Number(locator.height)) < 0.5
+        )
+          matching.push(candidateId);
+      }
+      candidateIds = matching;
+    }
+    if (candidateIds.length !== 1) throw new Error(candidateIds.length === 0 ? "not found" : "ambiguous");
+    const id = candidateIds[0];
     if (!id) throw new Error("element id");
     const visible = await this.#sessionRequest(
       "GET",
@@ -1020,9 +1138,11 @@ export class Mac2DesktopAdapter implements DesktopPort {
       value: unknown,
       roleHint?: string,
       inSelectedWindow = selectedWindow === undefined,
+      parentElementId?: ElementId,
+      logicalDepth = 0,
     ): void => {
       if (Array.isArray(value)) {
-        value.forEach((item) => visit(item, roleHint, inSelectedWindow));
+        value.forEach((item) => visit(item, roleHint, inSelectedWindow, parentElementId, logicalDepth));
         return;
       }
       const object = asObject(value);
@@ -1049,12 +1169,16 @@ export class Mac2DesktopAdapter implements DesktopPort {
           return;
         inSelectedWindow = true;
       }
+      let childParentId = parentElementId;
+      let childDepth = logicalDepth;
       if (inSelectedWindow && role?.startsWith("XCUIElementType")) {
         const elementId = this.#nextId("element") as ElementId;
         const summary = ElementSummarySchema.parse({
           elementId,
           role: role.replace("XCUIElementType", "").toLowerCase() || "element",
           nativeRole: role,
+          ...(parentElementId ? { parentElementId } : {}),
+          depth: logicalDepth,
           ...(typeof object.identifier === "string" && object.identifier
             ? { identifier: object.identifier }
             : {}),
@@ -1116,6 +1240,8 @@ export class Mac2DesktopAdapter implements DesktopPort {
             : {}),
         });
         output.push(summary);
+        childParentId = elementId;
+        childDepth = logicalDepth + 1;
         this.#locators.set(elementId, {
           role,
           ...(summary.identifier ? { identifier: summary.identifier } : {}),
@@ -1131,6 +1257,8 @@ export class Mac2DesktopAdapter implements DesktopPort {
           ...(summary.focused === undefined ? {} : { focused: summary.focused }),
           width: Number(object.width),
           height: Number(object.height),
+          x: Number(object.x),
+          y: Number(object.y),
         });
       }
       for (const [key, child] of Object.entries(object))
@@ -1153,7 +1281,7 @@ export class Mac2DesktopAdapter implements DesktopPort {
             "type",
           ].includes(key)
         )
-          visit(child, key, inSelectedWindow);
+          visit(child, key, inSelectedWindow, childParentId, childDepth);
     };
     visit(parsed);
     return { elements: output.slice(0, 5000), allElements: output, truncated: output.length > 5000 };
@@ -1190,6 +1318,19 @@ export class Mac2DesktopAdapter implements DesktopPort {
     return "exact" in match ? source === expected : source.includes(expected);
   }
 
+  #textXpath(field: string, match: TextMatch): string {
+    const upper = "ABCDEFGHIJKLMNOPQRSTUVWXYZ";
+    const lower = "abcdefghijklmnopqrstuvwxyz";
+    const source = match.caseSensitive
+      ? field
+      : `translate(${field}, ${xpathLiteral(upper)}, ${xpathLiteral(lower)})`;
+    const raw = "exact" in match ? match.exact : match.contains;
+    const expected = match.caseSensitive ? raw : raw.toLocaleLowerCase();
+    return "exact" in match
+      ? `${source}=${xpathLiteral(expected)}`
+      : `contains(${source}, ${xpathLiteral(expected)})`;
+  }
+
   #sanitizeElement(element: ElementSummary): ElementSummary {
     if (!this.sensitive) return element;
     const result = { ...element };
@@ -1200,35 +1341,63 @@ export class Mac2DesktopAdapter implements DesktopPort {
     return result;
   }
 
-  #matches(
-    element: ElementSummary,
-    query: Exclude<AssertionSpec, { kind: "aiVisual" | "elementOrder" }>["query"],
-  ): boolean {
-    const text = (
-      actual: string | undefined,
-      match:
-        | { exact: string; caseSensitive?: boolean | undefined }
-        | { contains: string; caseSensitive?: boolean | undefined }
-        | undefined,
-    ): boolean => {
-      if (!match) return true;
-      if (actual === undefined) return false;
-      const a = match.caseSensitive ? actual : actual.toLocaleLowerCase();
-      const expected = "exact" in match ? match.exact : match.contains;
-      const e = match.caseSensitive ? expected : expected.toLocaleLowerCase();
-      return "exact" in match ? a === e : a.includes(e);
-    };
+  #matchesSelector(element: ElementSummary, selector: ElementSelector): boolean {
+    const text = (actual: string | undefined, match: TextMatch | undefined): boolean =>
+      actual !== undefined && match !== undefined ? this.#textMatch(actual, match) : match === undefined;
     return (
-      (!query.role || element.role === query.role) &&
-      (!query.identifier || element.identifier === query.identifier) &&
-      text(element.name, query.name) &&
-      text(element.label, query.label) &&
-      text(element.value, query.value) &&
-      (!query.state ||
-        Object.entries(query.state).every(
+      (!selector.role || element.role === selector.role) &&
+      (!selector.identifier || element.identifier === selector.identifier) &&
+      text(element.name, selector.name) &&
+      text(element.label, selector.label) &&
+      text(element.value, selector.value) &&
+      (!selector.state ||
+        Object.entries(selector.state).every(
           ([key, value]) => element[key as "enabled" | "selected" | "focused"] === value,
         ))
     );
+  }
+
+  #matches(
+    element: ElementSummary,
+    query: Exclude<AssertionSpec, { kind: "aiVisual" | "elementOrder" }>["query"],
+    source: readonly ElementSummary[] = this.#allElements,
+  ): boolean {
+    const selector: ElementSelector = {
+      ...(query.role ? { role: query.role } : {}),
+      ...(query.identifier ? { identifier: query.identifier } : {}),
+      ...(query.name ? { name: query.name } : {}),
+      ...(query.label ? { label: query.label } : {}),
+      ...(query.value ? { value: query.value } : {}),
+      ...(query.state ? { state: query.state } : {}),
+    };
+    if (!this.#matchesSelector(element, selector)) return false;
+    const byId = new Map(source.map((item) => [item.elementId, item]));
+    const hasAncestor = (candidate: ElementSummary, match: ElementSelector): boolean => {
+      let parentId = candidate.parentElementId;
+      while (parentId) {
+        const parent = byId.get(parentId);
+        if (!parent) return false;
+        if (this.#matchesSelector(parent, match)) return true;
+        parentId = parent.parentElementId;
+      }
+      return false;
+    };
+    const descendsFrom = (candidate: ElementSummary, ancestorId: ElementId): boolean => {
+      let parentId = candidate.parentElementId;
+      while (parentId) {
+        if (parentId === ancestorId) return true;
+        parentId = byId.get(parentId)?.parentElementId;
+      }
+      return false;
+    };
+    if (query.ancestor && !hasAncestor(element, query.ancestor)) return false;
+    if (query.descendant)
+      return source.some(
+        (candidate) =>
+          this.#matchesSelector(candidate, query.descendant as ElementSelector) &&
+          descendsFrom(candidate, element.elementId),
+      );
+    return true;
   }
   #validateActionContext(action: DesktopAction): void {
     const refs: ElementRef[] =

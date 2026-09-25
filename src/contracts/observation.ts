@@ -7,7 +7,7 @@ export const TextMatchSchema = z.union([
   z.object({ contains: z.string(), caseSensitive: z.boolean().optional() }).strict(),
 ]);
 
-export const ElementQuerySchema = z
+export const ElementSelectorSchema = z
   .object({
     role: z.string().min(1).max(100).optional(),
     identifier: z.string().min(1).max(500).optional(),
@@ -25,6 +25,30 @@ export const ElementQuerySchema = z
   })
   .strict()
   .refine((v) => Object.keys(v).length > 0, "At least one query field is required");
+
+export const ElementQuerySchema = z
+  .object({
+    role: z.string().min(1).max(100).optional(),
+    identifier: z.string().min(1).max(500).optional(),
+    name: TextMatchSchema.optional(),
+    label: TextMatchSchema.optional(),
+    value: TextMatchSchema.optional(),
+    state: z
+      .object({
+        enabled: z.boolean().optional(),
+        selected: z.boolean().optional(),
+        focused: z.boolean().optional(),
+      })
+      .strict()
+      .optional(),
+    ancestor: ElementSelectorSchema.optional(),
+    descendant: ElementSelectorSchema.optional(),
+  })
+  .strict()
+  .refine(
+    (v) => Object.keys(v).some((key) => key !== "ancestor" && key !== "descendant"),
+    "At least one target query field is required",
+  );
 
 export const WindowQuerySchema = z
   .object({
@@ -51,6 +75,8 @@ export const ElementSummarySchema = z
     focused: z.boolean().optional(),
     isModal: z.boolean().optional(),
     isMain: z.boolean().optional(),
+    parentElementId: ElementIdSchema.optional(),
+    depth: z.number().int().nonnegative().max(128).optional(),
     geometry: z
       .object({
         x: z.number(),
@@ -94,6 +120,7 @@ export const ElementRefSchema = z
   .strict();
 
 export type TextMatch = z.infer<typeof TextMatchSchema>;
+export type ElementSelector = z.infer<typeof ElementSelectorSchema>;
 export type ElementQuery = z.infer<typeof ElementQuerySchema>;
 export type WindowQuery = z.infer<typeof WindowQuerySchema>;
 export type ElementSummary = z.infer<typeof ElementSummarySchema>;

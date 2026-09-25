@@ -16,6 +16,7 @@ const checkboxXml = (value: "0" | "1", selected: "false" | "true") =>
   `<?xml version="1.0"?><XCUIElementTypeApplication type="XCUIElementTypeApplication"><XCUIElementTypeWindow type="XCUIElementTypeWindow" title="Main" focused="true" x="0" y="0" width="800" height="600"><XCUIElementTypeCheckBox type="XCUIElementTypeCheckBox" identifier="fixture.checkbox" value="${value}" selected="${selected}" enabled="true" x="10" y="20" width="100" height="40"/></XCUIElementTypeWindow></XCUIElementTypeApplication>`;
 const textFieldXml = (value?: string) =>
   `<?xml version="1.0"?><XCUIElementTypeApplication type="XCUIElementTypeApplication"><XCUIElementTypeWindow type="XCUIElementTypeWindow" title="Main" focused="true" x="0" y="0" width="800" height="600"><XCUIElementTypeTextField type="XCUIElementTypeTextField" identifier="input"${value === undefined ? "" : ` value="${value}"`} enabled="true" x="10" y="20" width="200" height="40"/></XCUIElementTypeWindow></XCUIElementTypeApplication>`;
+const rowXml = `<?xml version="1.0"?><XCUIElementTypeApplication type="XCUIElementTypeApplication"><XCUIElementTypeWindow type="XCUIElementTypeWindow" title="Main" focused="true" x="0" y="0" width="800" height="600"><XCUIElementTypeGroup type="XCUIElementTypeGroup" value="First task"><XCUIElementTypeCheckBox type="XCUIElementTypeCheckBox" title="Toggle" value="0" enabled="true" x="10" y="20" width="40" height="40"/></XCUIElementTypeGroup><XCUIElementTypeGroup type="XCUIElementTypeGroup" value="Second task"><XCUIElementTypeCheckBox type="XCUIElementTypeCheckBox" title="Toggle" value="0" enabled="true" x="10" y="70" width="40" height="40"/></XCUIElementTypeGroup></XCUIElementTypeWindow></XCUIElementTypeApplication>`;
 const PNG_BYTES = Buffer.from([
   0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4e, 0x44,
 ]);
@@ -48,7 +49,75 @@ describe("Mac2DesktopAdapter", () => {
         },
       ],
     });
-    expect(compact).toContain('button "Click" id="fixture.click" enabled');
+    expect(compact).toContain('button "Click" id="fixture.click" depth=0 enabled');
+  });
+  it("projects hierarchy and resolves a child through an ancestor selector", async () => {
+    const fetcher: typeof fetch = async (input, init) => {
+      const url = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
+      const body = typeof init?.body === "string" ? (JSON.parse(init.body) as unknown) : undefined;
+      const value = url.endsWith("/timeouts")
+        ? { value: { command: 3_000_000 } }
+        : url.endsWith("/session") && init?.method === "POST"
+          ? { sessionId: "native-session", value: { sessionId: "native-session" } }
+          : url.endsWith("/source")
+            ? { value: rowXml }
+            : JSON.stringify(body ?? null).includes("macos: screenshots")
+              ? { value: { main: { isMain: true, payload: PNG_BYTES.toString("base64") } } }
+              : url.includes("/elements")
+                ? { value: [{ "element-6066-11e4-a52e-4f735466cecf": "native-window" }] }
+                : JSON.stringify(body ?? null).includes("macos: queryAppState")
+                  ? { value: 4 }
+                  : { value: null };
+      return new Response(JSON.stringify(value), { status: 200 });
+    };
+    const adapter = new Mac2DesktopAdapter(
+      fetcher,
+      undefined,
+      undefined,
+      () => ({ endpoint: "http://guest:4723", elementOriginActions: false }),
+      ids,
+    );
+    const signal = new AbortController().signal;
+    expect(
+      (
+        await adapter.startSession(
+          {
+            channelId: "operation-00000009" as OperationId,
+            bundleId: "com.example.App",
+            window: { title: { exact: "Main" } },
+          },
+          signal,
+        )
+      ).ok,
+    ).toBe(true);
+    const observed = await adapter.observe(
+      {
+        runId: "run-00000001" as RunId,
+        generation: 1,
+        observationId: "observation-00000001" as ObservationId,
+        sessionId: "session-00000001" as SessionId,
+        windowId: "window-00000001" as WindowId,
+      },
+      signal,
+    );
+    if (!observed.ok) throw new Error(observed.error.code);
+    const observation = {
+      ...observed.value.observation,
+      uiSnapshot: { artifactId: "artifact-00000001" as ArtifactId, sha256: "a".repeat(64) },
+    };
+    const page = adapter.queryPage(
+      observation,
+      { role: "checkbox", ancestor: { role: "group", value: { exact: "Second task" } } },
+      0,
+      10,
+    );
+    expect(page.ok && page.value.status).toBe("unique");
+    expect(page.ok && page.value.candidates[0]).toMatchObject({
+      role: "checkbox",
+      depth: 2,
+    });
+    expect(adapter.compact(observation)).toContain("  [");
+    expect(adapter.compact(observation)).toContain("parent=element-");
   });
   it.each([
     ["1", "false", true],
@@ -776,7 +845,7 @@ describe("Mac2DesktopAdapter", () => {
             : JSON.stringify(body ?? null).includes("macos: screenshots")
               ? { value: { main: { isMain: true, payload: PNG_BYTES.toString("base64") } } }
               : url.endsWith("/elements")
-                ? !JSON.stringify(body).includes("]//XCUIElementTypeButton")
+                ? !JSON.stringify(body).includes("XCUIElementTypeButton")
                   ? { value: [{ "element-6066-11e4-a52e-4f735466cecf": "native-window" }] }
                   : { value: [{ "element-6066-11e4-a52e-4f735466cecf": "native-save" }] }
                 : url.endsWith("/element/native-save/displayed")
@@ -911,7 +980,7 @@ describe("Mac2DesktopAdapter", () => {
               : JSON.stringify(body ?? null).includes("macos: screenshots")
                 ? { value: { main: { isMain: true, payload: PNG_BYTES.toString("base64") } } }
                 : url.endsWith("/elements")
-                  ? !JSON.stringify(body).includes("]//XCUIElementTypeButton")
+                  ? !JSON.stringify(body).includes("XCUIElementTypeButton")
                     ? { value: [{ "element-6066-11e4-a52e-4f735466cecf": "native-window" }] }
                     : { value: [{ "element-6066-11e4-a52e-4f735466cecf": "native-save" }] }
                   : url.endsWith("/element/native-save/rect")
@@ -1025,7 +1094,32 @@ describe("Mac2DesktopAdapter", () => {
       elementId: button.elementId,
     };
     const action: DesktopAction = { kind: "click", target: { element: ref, point: { x: 0.2, y: 0.5 } } };
+    const actionCallsStart = calls.length;
     expect((await adapter.dispatch(action, "operation-00000001" as OperationId, signal)).ok).toBe(true);
+    const actionCalls = calls.slice(actionCallsStart);
+    const foregroundIndex = actionCalls.findIndex((call) =>
+      JSON.stringify(call.body ?? null).includes("macos: queryAppState"),
+    );
+    const windowIndex = actionCalls.findIndex(
+      (call) =>
+        call.url.endsWith("/elements") &&
+        JSON.stringify(call.body ?? null).includes("//XCUIElementTypeWindow"),
+    );
+    const targetIndex = actionCalls.findIndex(
+      (call) =>
+        call.url.endsWith("/elements") &&
+        JSON.stringify(call.body ?? null).includes("**/XCUIElementTypeWindow"),
+    );
+    const dispatchIndex = actionCalls.findIndex((call) =>
+      JSON.stringify(call.body ?? null).includes("macos: click"),
+    );
+    expect([foregroundIndex, windowIndex, targetIndex, dispatchIndex]).toEqual(
+      [...[foregroundIndex, windowIndex, targetIndex, dispatchIndex]].sort((left, right) => left - right),
+    );
+    expect(foregroundIndex).toBeGreaterThanOrEqual(0);
+    expect(windowIndex).toBeGreaterThan(foregroundIndex);
+    expect(targetIndex).toBeGreaterThan(windowIndex);
+    expect(dispatchIndex).toBeGreaterThan(targetIndex);
     const staleVisual = await adapter.evaluate(
       { kind: "aiVisual", goal: "Button is present", accepted: true },
       visualObservation,
@@ -1047,9 +1141,9 @@ describe("Mac2DesktopAdapter", () => {
     );
     const liveResolution = calls.filter((call) => call.url.endsWith("/elements")).at(-1);
     expect(liveResolution?.body).toEqual({
-      using: "xpath",
+      using: "class chain",
       value:
-        "//XCUIElementTypeWindow[translate(@title, 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz')='main']//XCUIElementTypeButton[@identifier='save' and @title='Save' and @enabled='true']",
+        '**/XCUIElementTypeWindow[`title ==[c] "Main"`]/**/XCUIElementTypeButton[`identifier == "save" AND title == "Save" AND enabled == TRUE`]',
     });
     expect(
       adapter

@@ -62,6 +62,34 @@ const support = {
   hasher: { sha256: (input: string | Uint8Array) => createHash("sha256").update(input).digest("hex") },
   secrets: { resolve: () => undefined },
 };
+const transactionObservation = (
+  runId: RunId,
+  observationId: string,
+  sessionId: Observation["sessionId"],
+  windowId: Observation["windowId"],
+): Observation => ({
+  runId,
+  environmentId: "environment-test",
+  generation: 1,
+  observationId: observationId as Observation["observationId"],
+  sessionId,
+  windowId,
+  capturedAt: "2026-09-21T00:00:00.000Z",
+  screenshotScope: "window",
+  screenshot: { artifactId: "artifact-00000001" as never, sha256: "a".repeat(64) },
+  uiSnapshot: { artifactId: "artifact-00000002" as never, sha256: "b".repeat(64) },
+  coverage: "complete",
+  elements: [
+    {
+      elementId: "element-00000001" as never,
+      role: "button",
+      name: "Save",
+      visible: true,
+      enabled: true,
+      geometry: { x: 0, y: 0, width: 100, height: 40 },
+    },
+  ],
+});
 
 const config = (root: string) => ({
   image: {
@@ -337,6 +365,12 @@ describe("gateway", () => {
         sessionId: "session-00000001" as Observation["sessionId"],
         windowId: "window-00000001" as Observation["windowId"],
         expectedObservationId: "observation-00000001",
+        beforeObservation: transactionObservation(
+          "run-00000001" as RunId,
+          "observation-00000001",
+          "session-00000001" as Observation["sessionId"],
+          "window-00000001" as Observation["windowId"],
+        ),
         sequence: 0,
         startedMono: 0,
         readyUntilMs: 0,
@@ -422,7 +456,13 @@ describe("gateway", () => {
         generation: 1,
         sessionId: "session-0001" as Observation["sessionId"],
         windowId: "window-0001" as Observation["windowId"],
-        expectedObservationId: "observation-0001",
+        expectedObservationId: "observation-00000001",
+        beforeObservation: transactionObservation(
+          "run-00000001" as RunId,
+          "observation-00000001",
+          "session-0001" as Observation["sessionId"],
+          "window-0001" as Observation["windowId"],
+        ),
         sequence: 1,
         startedMono: 0,
       },
@@ -472,7 +512,13 @@ describe("gateway", () => {
         generation: 1,
         sessionId: "session-0001" as Observation["sessionId"],
         windowId: "window-0001" as Observation["windowId"],
-        expectedObservationId: "observation-0001",
+        expectedObservationId: "observation-00000001",
+        beforeObservation: transactionObservation(
+          "run-00000001" as RunId,
+          "observation-00000001",
+          "session-0001" as Observation["sessionId"],
+          "window-0001" as Observation["windowId"],
+        ),
         sequence: 1,
         startedMono: 0,
       },
@@ -532,7 +578,13 @@ describe("gateway", () => {
         generation: 1,
         sessionId: "session-0001" as Observation["sessionId"],
         windowId: "window-0001" as Observation["windowId"],
-        expectedObservationId: "observation-0001",
+        expectedObservationId: "observation-00000001",
+        beforeObservation: transactionObservation(
+          "run-00000001" as RunId,
+          "observation-00000001",
+          "session-0001" as Observation["sessionId"],
+          "window-0001" as Observation["windowId"],
+        ),
         sequence: 1,
         startedMono: 0,
       },
@@ -584,7 +636,13 @@ describe("gateway", () => {
         generation: 1,
         sessionId: "session-0001" as Observation["sessionId"],
         windowId: "window-0001" as Observation["windowId"],
-        expectedObservationId: "observation-0001",
+        expectedObservationId: "observation-00000001",
+        beforeObservation: transactionObservation(
+          "run-00000001" as RunId,
+          "observation-00000001",
+          "session-0001" as Observation["sessionId"],
+          "window-0001" as Observation["windowId"],
+        ),
         sequence: 1,
         startedMono: 0,
         preconditions: [{ kind: "visible", query: { role: "button" } }],
@@ -829,7 +887,7 @@ describe("gateway", () => {
       timeline.ok ? timeline.value.map((_, index) => index + 1) : [],
     );
   });
-  it("retains partial before artifacts and does not dispatch when snapshot commit fails", async () => {
+  it("reuses committed before Evidence and marks an after snapshot commit failure incomplete", async () => {
     const root = await mkdtemp(join(tmpdir(), "mcu-before-partial-"));
     roots.push(root);
     const platform = new FakePlatform();
@@ -861,6 +919,12 @@ describe("gateway", () => {
         sessionId: "session-00000001" as Observation["sessionId"],
         windowId: "window-00000001" as Observation["windowId"],
         expectedObservationId: "observation-00000001",
+        beforeObservation: transactionObservation(
+          "run-00000001" as RunId,
+          "observation-00000001",
+          "session-00000001" as Observation["sessionId"],
+          "window-00000001" as Observation["windowId"],
+        ),
         sequence: 0,
         startedMono: 0,
       },
@@ -868,10 +932,10 @@ describe("gateway", () => {
       [],
       new AbortController().signal,
     );
-    expect(result.ok && result.value.result.dispatch).toBe("notDispatched");
+    expect(result.ok && result.value.result.dispatch).toBe("dispatched");
     expect(result.ok && result.value.artifacts).toHaveLength(1);
     expect(result.ok && result.value.evidenceComplete).toBe(false);
-    expect(dispatch).not.toHaveBeenCalled();
+    expect(dispatch).toHaveBeenCalledOnce();
   });
   it("evaluates a standalone predeclared assertion on a new Observation and closes the handle", async () => {
     const root = await mkdtemp(join(tmpdir(), "mcu-assert-"));
@@ -967,11 +1031,10 @@ describe("gateway", () => {
     const root = await mkdtemp(join(tmpdir(), "mcu-after-failure-"));
     roots.push(root);
     const platform = new FakePlatform();
-    const observe = platform.observe.bind(platform);
     let count = 0;
-    vi.spyOn(platform, "observe").mockImplementation(async (request) => {
-      if (++count > 1) throw new Error("capture failure");
-      return observe(request);
+    vi.spyOn(platform, "observe").mockImplementation(async () => {
+      count += 1;
+      throw new Error("capture failure");
     });
     const evidence = new LocalEvidenceAdapter(join(root, "evidence"), join(root, "state"), 10_000);
     const runId = "run-00000001" as RunId;
@@ -997,6 +1060,12 @@ describe("gateway", () => {
         sessionId: "session-00000001" as Observation["sessionId"],
         windowId: "window-00000001" as Observation["windowId"],
         expectedObservationId: "observation-00000001",
+        beforeObservation: transactionObservation(
+          "run-00000001" as RunId,
+          "observation-00000001",
+          "session-00000001" as Observation["sessionId"],
+          "window-00000001" as Observation["windowId"],
+        ),
         sequence: 1,
         startedMono: 0,
       },
@@ -1011,7 +1080,8 @@ describe("gateway", () => {
       retryDisposition: "unsafe",
     });
     expect(result.ok && result.value.evidenceComplete).toBe(false);
-    expect(result.ok && result.value.artifacts?.length).toBe(2);
+    expect(result.ok && result.value.artifacts).toHaveLength(0);
+    expect(count).toBe(1);
   });
   it("retries only the after Observation and never replays a successful action", async () => {
     const root = await mkdtemp(join(tmpdir(), "mcu-after-retry-"));
@@ -1066,7 +1136,13 @@ describe("gateway", () => {
         generation: 1,
         sessionId: "session-0001" as Observation["sessionId"],
         windowId: "window-0001" as Observation["windowId"],
-        expectedObservationId: "observation-0001",
+        expectedObservationId: "observation-00000001",
+        beforeObservation: transactionObservation(
+          "run-00000001" as RunId,
+          "observation-00000001",
+          "session-0001" as Observation["sessionId"],
+          "window-0001" as Observation["windowId"],
+        ),
         sequence: 1,
         startedMono: 0,
       },
@@ -1189,7 +1265,13 @@ describe("gateway", () => {
         generation: 1,
         sessionId: "session-0001" as Observation["sessionId"],
         windowId: "window-0001" as Observation["windowId"],
-        expectedObservationId: "observation-0001",
+        expectedObservationId: "observation-00000001",
+        beforeObservation: transactionObservation(
+          "run-00000001" as RunId,
+          "observation-00000001",
+          "session-0001" as Observation["sessionId"],
+          "window-0001" as Observation["windowId"],
+        ),
         sequence: 1,
         startedMono: 0,
       },
@@ -1243,7 +1325,13 @@ describe("gateway", () => {
         generation: 1,
         sessionId: "session-0001" as Observation["sessionId"],
         windowId: "window-0001" as Observation["windowId"],
-        expectedObservationId: "observation-0001",
+        expectedObservationId: "observation-00000001",
+        beforeObservation: transactionObservation(
+          "run-00000001" as RunId,
+          "observation-00000001",
+          "session-0001" as Observation["sessionId"],
+          "window-0001" as Observation["windowId"],
+        ),
         sequence: 1,
         startedMono: 0,
       },
@@ -1294,7 +1382,13 @@ describe("gateway", () => {
         generation: 1,
         sessionId: "session-0001" as Observation["sessionId"],
         windowId: "window-0001" as Observation["windowId"],
-        expectedObservationId: "observation-0001",
+        expectedObservationId: "observation-00000001",
+        beforeObservation: transactionObservation(
+          "run-00000001" as RunId,
+          "observation-00000001",
+          "session-0001" as Observation["sessionId"],
+          "window-0001" as Observation["windowId"],
+        ),
         sequence: 1,
         startedMono: 0,
       },
@@ -1332,7 +1426,7 @@ describe("gateway", () => {
       let matchingEvents = 0;
       vi.spyOn(evidence, "append").mockImplementation((event, signal) => {
         if (event.type === failedType) matchingEvents += 1;
-        const failureOccurrence = failedType === "ObservationCaptured" ? 2 : 1;
+        const failureOccurrence = 1;
         if (!failed && event.type === failedType && matchingEvents === failureOccurrence) {
           failed = true;
           return Promise.resolve({
@@ -1359,6 +1453,12 @@ describe("gateway", () => {
           sessionId: "session-00000001" as Observation["sessionId"],
           windowId: "window-00000001" as Observation["windowId"],
           expectedObservationId: "observation-00000001",
+          beforeObservation: transactionObservation(
+            "run-00000001" as RunId,
+            "observation-00000001",
+            "session-00000001" as Observation["sessionId"],
+            "window-00000001" as Observation["windowId"],
+          ),
           sequence: 1,
           startedMono: 0,
         },
@@ -1633,7 +1733,13 @@ describe("gateway", () => {
         generation: 1,
         sessionId: "session-0001" as Observation["sessionId"],
         windowId: "window-0001" as Observation["windowId"],
-        expectedObservationId: "observation-0001",
+        expectedObservationId: "observation-00000001",
+        beforeObservation: transactionObservation(
+          "run-00000001" as RunId,
+          "observation-00000001",
+          "session-0001" as Observation["sessionId"],
+          "window-0001" as Observation["windowId"],
+        ),
         sequence: 1,
         startedMono: 0,
       },
@@ -1646,7 +1752,7 @@ describe("gateway", () => {
             generation: 1,
             sessionId: "session-0001" as Observation["sessionId"],
             windowId: "window-0001" as Observation["windowId"],
-            observationId: "observation-0001" as Observation["observationId"],
+            observationId: "observation-00000001" as Observation["observationId"],
             elementId: "element-00000001" as Observation["elements"][number]["elementId"],
           },
         },

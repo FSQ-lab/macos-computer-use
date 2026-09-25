@@ -12,7 +12,7 @@ import {
   RunResultSchema,
 } from "../../contracts/public.js";
 
-export const AGENT_TASK_PROTOCOL_VERSION = 2 as const;
+export const AGENT_TASK_PROTOCOL_VERSION = 3 as const;
 export const TaskIdSchema = z.string().regex(/^task-[a-f0-9]{24}$/);
 export const TaskRequestIdSchema = z.string().regex(/^req-[a-f0-9]{16,64}$/);
 
@@ -55,12 +55,15 @@ const requestSchemas = [
   EnvelopeSchema.extend({
     type: z.literal("begin"),
     application: ApplicationTargetSchema,
-    finalAssertions: z.array(AssertionSpecSchema).min(1).max(50),
   }).strict(),
   EnvelopeSchema.extend({ type: z.literal("heartbeat") }).strict(),
   EnvelopeSchema.extend({ type: z.literal("observe") }).strict(),
   EnvelopeSchema.extend({ type: z.literal("query"), query: ElementQuerySchema }).strict(),
   EnvelopeSchema.extend({ type: z.literal("expand"), elementId: ElementIdSchema }).strict(),
+  EnvelopeSchema.extend({
+    type: z.literal("freezeAssertions"),
+    assertions: z.array(AssertionSpecSchema).min(1).max(50),
+  }).strict(),
   EnvelopeSchema.extend({
     type: z.literal("action"),
     target: ElementQuerySchema.optional(),
@@ -116,11 +119,20 @@ export const SafeElementSummarySchema = z
     focused: z.boolean().optional(),
     isModal: z.boolean().optional(),
     isMain: z.boolean().optional(),
+    parentElementId: ElementIdSchema.optional(),
+    depth: z.number().int().nonnegative().max(128).optional(),
   })
   .strict();
 
 export const TaskValueSchema = z.discriminatedUnion("kind", [
-  z.object({ kind: z.literal("begun"), leaseId: z.string().min(1).max(128) }).strict(),
+  z
+    .object({
+      kind: z.literal("begun"),
+      leaseId: z.string().min(1).max(128),
+      observationId: ObservationIdSchema,
+      compact: z.string().max(100_000),
+    })
+    .strict(),
   z.object({ kind: z.literal("heartbeat"), alive: z.literal(true) }).strict(),
   z
     .object({
@@ -129,8 +141,18 @@ export const TaskValueSchema = z.discriminatedUnion("kind", [
       compact: z.string().max(100_000),
     })
     .strict(),
-  z.object({ kind: z.literal("query"), element: SafeElementSummarySchema }).strict(),
+  z
+    .object({
+      kind: z.literal("query"),
+      status: z.enum(["unique", "ambiguous", "notFound", "incomplete"]),
+      observationId: ObservationIdSchema,
+      count: z.number().int().nonnegative(),
+      candidates: z.array(SafeElementSummarySchema).max(100),
+      element: SafeElementSummarySchema.optional(),
+    })
+    .strict(),
   z.object({ kind: z.literal("expanded"), element: SafeElementSummarySchema }).strict(),
+  z.object({ kind: z.literal("assertionsFrozen"), count: z.number().int().positive().max(50) }).strict(),
   z
     .object({
       kind: z.literal("action"),
@@ -194,6 +216,7 @@ const TaskResponseTypeSchema = z.enum([
   "observe",
   "query",
   "expand",
+  "freezeAssertions",
   "action",
   "assert",
   "finish",
@@ -215,6 +238,7 @@ export const TaskResponseSchema = z
       observe: "observation",
       query: "query",
       expand: "expanded",
+      freezeAssertions: "assertionsFrozen",
       action: "action",
       assert: "assertion",
       finish: "finished",

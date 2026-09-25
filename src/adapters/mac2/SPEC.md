@@ -31,16 +31,16 @@ One Observation captures one canonical Mac2 page source plus one Mac2 main-displ
 
 Page source prefers standard Mac2/WDA `/source`. If it fails, the Adapter may invoke exactly one provider-owned `macos: source` with `format: xml`. Both paths feed the identical bounded XML parser and selected-window ownership checks; the fallback cannot activate the app, alter focus, or bypass sanitization. The action is never replayed.
 
-Two deterministic projections share the same snapshot and logical Element IDs:
+Two deterministic projections share the same snapshot, logical Element IDs, and bounded logical parent/depth relationships:
 
-- Compact view: bounded lines containing snapshot/app/window identity, logical Element ID, stable accessibility identifier when present, neutral role, primary text, key states, coverage and truncation. The identifier is a locator signal, not a provider-native ID.
-- Structured query/expand view: complete usable locator signals, neutral/native type mapping, state, geometry, match cardinality, continuation and truncation diagnostics.
+- Compact view: bounded indented lines containing snapshot/app/window identity, logical Element ID, logical parent when present, depth, stable accessibility identifier when present, neutral role, primary text, key states, coverage and truncation. The identifier is a locator signal, not a provider-native ID.
+- Structured query/expand view: complete usable locator signals, logical parent/depth, neutral/native type mapping, state, geometry, match cardinality, continuation and truncation diagnostics.
 
 Compact absence never proves element absence. Structured queries scan the unabridged bounded internal source before display clipping. Incomplete scanning never returns an exhaustive notFound claim.
 
 ## Element Resolution
 
-Query fields constrain the same element conjunctively. The Adapter safely encodes literal values and never weakens a failed query. Action and assertion targets require a unique live match. Ambiguity returns bounded candidate summaries and no effect. A latest-snapshot ElementRef is revalidated against generation/session/window and live state immediately before dispatch.
+Target selector fields constrain the same element conjunctively. Optional flat ancestor and descendant selectors are evaluated against the canonical parsed hierarchy, transitively but only within the selected window; caller input never contains XPath, class-chain predicates, or native IDs. The Adapter safely generates and escapes a Mac2 class-chain locator for ordinary flat target rebind and a bounded Adapter-owned XPath only for relationship rebind; it never weakens a failed query. Action and assertion targets require a unique live target match. Ambiguity returns bounded candidate summaries and no effect. A latest-snapshot ElementRef is revalidated immediately before dispatch against generation/session and one live target query. Native geometry narrows duplicate provider representations without authorizing coordinate actions. Targetless keyboard actions instead use live application foreground state plus unique owned-window resolution. Dispatch does not fetch a second full page source or screenshot: the committed canonical before-Observation supplies structural authority, the lightweight live checks supply current ownership/target authority, and the mandatory after-Observation captures the next full source and display screenshot.
 
 ## Element-Relative Actions
 

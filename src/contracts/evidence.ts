@@ -35,6 +35,7 @@ export const EventTypeSchema = z.enum([
   "EnvironmentAllocated",
   "ReadinessEvaluated",
   "ObservationCaptured",
+  "FinalAssertionsFrozen",
   "ActionPlanned",
   "ProviderReceiptRecorded",
   "ActionResultRecorded",
@@ -68,6 +69,9 @@ const EventDataSchemas = {
       screenshot: ArtifactRefSchema.optional(),
       uiSnapshot: ArtifactRefSchema.optional(),
     })
+    .strict(),
+  FinalAssertionsFrozen: z
+    .object({ count: z.number().int().positive().max(50), observationId: ObservationIdSchema })
     .strict(),
   ActionPlanned: z
     .object({ actionId: ActionIdSchema, operationId: OperationIdSchema, kind: z.string() })

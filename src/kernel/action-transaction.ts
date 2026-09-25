@@ -33,6 +33,7 @@ export type TransactionContext = {
   sessionId: SessionId;
   windowId: WindowId;
   expectedObservationId: string;
+  beforeObservation: Observation;
   sequence: number;
   startedMono: number;
   window?: WindowQuery;
@@ -123,37 +124,22 @@ export class ActionTransaction {
     const operationId = this.ids.next("operation") as OperationId;
     const actionId = this.ids.next("action") as ActionId;
     let sequence = context.sequence;
-    const beforeCaptured = await this.#observeForAction(context, signal, false);
-    if (!beforeCaptured.ok) return beforeCaptured;
-    const progress = { sequence, artifacts: [] as ArtifactDescriptor[] };
-    const beforeArtifacts = await this.#commitObservation(
-      context,
-      beforeCaptured.value,
-      sequence,
-      progress,
-      signal,
-      false,
-    );
-    if (!beforeArtifacts.ok)
-      return this.#output({
-        result: {
-          dispatch: "notDispatched",
-          providerOutcome: "unknown",
-          verification: "unverifiable",
-          retryDisposition: "safe",
-        },
-        sequence: progress.sequence,
-        artifacts: progress.artifacts,
-        evidenceComplete: false,
+    const beforeObservation = context.beforeObservation;
+    if (beforeObservation.observationId !== context.expectedObservationId)
+      return err({
+        code: "StaleElementRef",
+        phase: "action",
+        message: "Committed before-Observation is stale.",
+        retryDisposition: "safe",
+        dispatch: "notDispatched",
       });
-    sequence = beforeArtifacts.value.sequence;
-    let transactionEvidenceComplete = beforeArtifacts.value.screenshotError === undefined;
-    const retainedArtifacts = [...beforeArtifacts.value.artifacts];
+    let transactionEvidenceComplete = beforeObservation.screenshotScope !== "unavailable";
+    const retainedArtifacts: ArtifactDescriptor[] = [];
     for (const assertion of context.preconditions ?? []) {
       const evaluated = await withStageSignal(
         budget(this.timeouts.assertionMs),
         signal,
-        (stageSignal) => this.desktop.evaluate(assertion, beforeArtifacts.value.observation, stageSignal),
+        (stageSignal) => this.desktop.evaluate(assertion, beforeObservation, stageSignal),
         this.clock,
       ).catch(() =>
         err({
@@ -172,7 +158,7 @@ export class ActionTransaction {
           kind: assertion.kind,
           status,
           reason: evaluated.ok ? evaluated.value.reason : evaluated.error.code,
-          observationId: beforeArtifacts.value.observation.observationId,
+          observationId: beforeObservation.observationId,
         },
         signal,
       );
@@ -190,7 +176,7 @@ export class ActionTransaction {
           evidenceComplete: committed.ok,
         });
     }
-    const rebound = this.desktop.rebind(action, beforeArtifacts.value.observation);
+    const rebound = this.desktop.rebind(action, beforeObservation);
     if (!rebound.ok)
       return this.#output({
         result: {
@@ -481,11 +467,7 @@ export class ActionTransaction {
         artifacts: retainedArtifacts,
         evidenceComplete: false,
       });
-    const committedArtifacts = [
-      ...beforeArtifacts.value.artifacts,
-      ...(screenshot?.ok ? [screenshot.value] : []),
-      snapshot.value,
-    ];
+    const committedArtifacts = [...(screenshot?.ok ? [screenshot.value] : []), snapshot.value];
     if (receipt.value.dispatch !== "dispatched" || receipt.value.outcome !== "succeeded") {
       const disposition =
         receipt.value.dispatch === "notDispatched"

@@ -19,10 +19,25 @@ describe("Pi task protocol", () => {
         ...envelope,
         type: "begin",
         application: { name: "Fixture" },
-        finalAssertions: [{ kind: "visible", query: { role: "button" } }],
       }),
     ).toBeTruthy();
     expect(() => TaskRequestSchema.parse({ ...envelope, protocolVersion: 1, type: "observe" })).toThrow();
+    expect(() => TaskRequestSchema.parse({ ...envelope, protocolVersion: 2, type: "observe" })).toThrow();
+    expect(() =>
+      TaskRequestSchema.parse({
+        ...envelope,
+        type: "begin",
+        application: { name: "Fixture" },
+        finalAssertions: [{ kind: "visible", query: { role: "button" } }],
+      }),
+    ).toThrow();
+    expect(
+      TaskRequestSchema.parse({
+        ...envelope,
+        type: "freezeAssertions",
+        assertions: [{ kind: "visible", query: { role: "button" } }],
+      }),
+    ).toBeTruthy();
     expect(() => TaskRequestSchema.parse({ ...envelope, type: "observe", extra: true })).toThrow();
   });
 

@@ -19,6 +19,7 @@ The module public entry point exports the following schema/type families. Unknow
 `RunId`, `ActionId`, `ObservationId`, `AssertionId`, `ArtifactId`, `SessionId`, `WindowId`, `ElementId`, `LeaseId`, and `OperationId` are distinct validated branded strings. Kernel generates public IDs using UUIDv7 or an equivalently secure time-sortable format. IDs contain no user data, paths, Provider names, or secrets.
 
 Events carry UTC `recordedAt`, monotonic `elapsedMs`, and a non-negative integer `sequence`. Sequence is the only ordering authority.
+Pi-managed timelines include one `FinalAssertionsFrozen` event after initial readiness and before goal-changing actions. It records only the nonzero assertion count and the current Observation ID; assertion text remains in runner/Kernel state and is not duplicated into event data.
 
 ### Operation And Error Results
 
@@ -57,11 +58,11 @@ type RunResult = {
 
 ### Observation And Query
 
-A canonical `Observation` binds Run, environment, generation, session, logical window, observation ID, captured time, optional screenshot ArtifactRef, required UI snapshot ArtifactRef, screenshot scope (`window`, `display`, or `unavailable`), completeness diagnostics, and logical element summaries. The Mac2 Adapter produces only `display` through the bounded `macos: screenshots` command or `unavailable`; the shared schema retains `window` for provider-neutral compatibility but no current production Adapter emits it. `unavailable` is permitted after initial readiness for an action-before or action-after Observation whose structured UI capture and ownership checks succeeded while the Mac2 display image failed. Display scope may include other visible Guest UI. It never exposes Appium/WDA/native IDs.
+A canonical `Observation` binds Run, environment, generation, session, logical window, observation ID, captured time, optional screenshot ArtifactRef, required UI snapshot ArtifactRef, screenshot scope (`window`, `display`, or `unavailable`), completeness diagnostics, and logical element summaries. Each summary may include one same-Observation logical `parentElementId` plus bounded nonnegative `depth`; roots omit the parent. Parent references must resolve inside the same complete internal selected-window snapshot and never expose a native handle. The Mac2 Adapter produces only `display` through the bounded `macos: screenshots` command or `unavailable`; the shared schema retains `window` for provider-neutral compatibility but no current production Adapter emits it. `unavailable` is permitted after initial readiness for an action-before or action-after Observation whose structured UI capture and ownership checks succeeded while the Mac2 display image failed. Display scope may include other visible Guest UI. It never exposes Appium/WDA/native IDs.
 
 Element summaries may expose observation-only geometry (`x`, `y`, `width`, `height`) as descriptive data. This does not authorize absolute-coordinate action inputs or fallback. Element-targeted actions still use ElementRefs and, where applicable, normalized relative positions; converted action pixel offsets remain Adapter-private.
 
-`ElementQuery` supports conjunctive neutral role, identifier, exact/contains name, label, value, and enabled/selected/focused state filters. Query results are `unique`, `ambiguous`, `notFound`, or `incomplete`. Unknown state is not false. Only a unique result creates an `ElementRef`.
+`ElementSelector` is a strict nonempty flat conjunction of neutral role, identifier, exact/contains name, label, value, and enabled/selected/focused state filters. `ElementQuery` contains the target selector fields plus optional `ancestor` and `descendant` ElementSelectors. Relationship selectors cannot contain another relationship. `ancestor` means at least one transitive logical ancestor matches; `descendant` means at least one transitive logical descendant matches. Both relationships remain inside the selected window and latest bounded snapshot. Query results are `unique`, `ambiguous`, `notFound`, or `incomplete` and include at most 100 bounded safe candidates; unknown state is not false. Only a unique target result creates an `ElementRef`.
 
 `WindowQuery` supports title text matching, role, main-window and modal filters. Window selection must be unique.
 

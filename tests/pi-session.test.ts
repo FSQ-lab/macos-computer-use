@@ -35,6 +35,21 @@ const postActionObservation = (): Observation => ({
 
 const fakeRun = (): ClientRun => ({
   leaseId: "lease-00000001" as LeaseId,
+  currentObservation: () =>
+    ok({
+      observationId: "observation-00000001" as never,
+      runId: "run-00000001" as never,
+      environmentId: "environment-1",
+      generation: 1,
+      sessionId: "session-00000001" as never,
+      windowId: "window-00000001" as never,
+      capturedAt: "2026-09-23T00:00:00.000Z",
+      screenshotScope: "window",
+      screenshot: { artifactId: "artifact-00000001" as never, sha256: "a".repeat(64) },
+      uiSnapshot: { artifactId: "artifact-00000002" as never, sha256: "b".repeat(64) },
+      coverage: "complete",
+      elements: [],
+    }),
   observe: async () =>
     ok({
       observationId: "observation-00000001" as never,
@@ -74,6 +89,7 @@ const fakeRun = (): ClientRun => ({
       observationRef: { artifactId: "artifact-00000002" as never, sha256: "b".repeat(64) },
       reason: "ok",
     }),
+  freezeFinalAssertions: async () => ok({ frozen: true as const }),
   query: () =>
     ok({
       runId: "run-00000001" as never,
@@ -86,10 +102,19 @@ const fakeRun = (): ClientRun => ({
     }),
   queryPage: () =>
     ok({
-      status: "notFound",
+      status: "unique",
       observationId: "observation-00000001" as never,
-      count: 0,
-      candidates: [],
+      count: 1,
+      candidates: [{ elementId: "element-00000001" as never, role: "button", name: "Save" }],
+      reference: {
+        runId: "run-00000001" as never,
+        environmentId: "environment-1",
+        generation: 1,
+        sessionId: "session-00000001" as never,
+        windowId: "window-00000001" as never,
+        observationId: "observation-00000001" as never,
+        elementId: "element-00000001" as never,
+      },
     }),
   compact: () => ok("button Save"),
   expand: () =>
@@ -148,13 +173,45 @@ const call = async (session: PiTaskSession, message: unknown): Promise<TaskRespo
 };
 
 describe("PiTaskSession", () => {
+  it("requires one immutable assertion freeze before normal finish", async () => {
+    const session = new PiTaskSession(fakeClient());
+    const begun = await call(session, request(1, "begin", { application: { name: "Fixture" } }));
+    expect(begun).toMatchObject({
+      ok: true,
+      value: { kind: "begun", observationId: "observation-00000001", compact: "button Save" },
+    });
+    expect(await call(session, request(2, "finish"))).toMatchObject({
+      ok: false,
+      error: { code: "TaskState" },
+    });
+    expect(
+      await call(
+        session,
+        request(3, "freezeAssertions", {
+          assertions: [{ kind: "visible", query: { role: "button" } }],
+        }),
+      ),
+    ).toMatchObject({ ok: true, value: { kind: "assertionsFrozen", count: 1 } });
+    expect(
+      await call(
+        session,
+        request(4, "freezeAssertions", {
+          assertions: [{ kind: "visible", query: { role: "button" } }],
+        }),
+      ),
+    ).toMatchObject({ ok: false, error: { code: "TaskState" } });
+    expect(await call(session, request(5, "finish"))).toMatchObject({
+      ok: true,
+      value: { kind: "finished" },
+    });
+  });
+
   it("projects safe logical values and strips artifacts, native roles, and geometry", async () => {
     const session = new PiTaskSession(fakeClient());
     await call(
       session,
       request(1, "begin", {
         application: { name: "Fixture" },
-        finalAssertions: [{ kind: "visible", query: { role: "button" } }],
       }),
     );
     const query = await call(session, request(2, "query", { query: { role: "button" } }));
@@ -205,7 +262,6 @@ describe("PiTaskSession", () => {
       session,
       request(1, "begin", {
         application: { name: "Fixture" },
-        finalAssertions: [{ kind: "visible", query: { role: "button" } }],
       }),
     );
     const violation = await call(session, request(3, "observe"));
@@ -228,7 +284,6 @@ describe("PiTaskSession", () => {
       session,
       request(1, "begin", {
         application: { name: "Fixture" },
-        finalAssertions: [{ kind: "visible", query: { role: "button" } }],
       }),
     );
     const failed = await call(
@@ -257,7 +312,6 @@ describe("PiTaskSession", () => {
       session,
       request(1, "begin", {
         application: { name: "Fixture" },
-        finalAssertions: [{ kind: "visible", query: { role: "button" } }],
       }),
     );
     now = 151;
@@ -286,7 +340,6 @@ describe("PiTaskSession", () => {
       session,
       request(1, "begin", {
         application: { name: "Fixture" },
-        finalAssertions: [{ kind: "visible", query: { role: "button" } }],
       }),
     );
     const actions = [
@@ -327,10 +380,15 @@ describe("PiTaskSession", () => {
       session,
       request(1, "begin", {
         application: { name: "Fixture" },
-        finalAssertions: [{ kind: "visible", query: { role: "button" } }],
       }),
     );
-    const finished = await call(session, request(2, "finish"));
+    await call(
+      session,
+      request(2, "freezeAssertions", {
+        assertions: [{ kind: "visible", query: { role: "button" } }],
+      }),
+    );
+    const finished = await call(session, request(3, "finish"));
     expect(order).toEqual(["recover", "run"]);
     expect(finished).toMatchObject({
       ok: true,
@@ -353,7 +411,6 @@ describe("PiTaskSession", () => {
       session,
       request(1, "begin", {
         application: { name: "Fixture" },
-        finalAssertions: [{ kind: "visible", query: { role: "button" } }],
       }),
     );
     await new Promise((resolve) => setImmediate(resolve));
@@ -383,7 +440,6 @@ describe("PiTaskSession", () => {
       session,
       request(1, "begin", {
         application: { name: "Fixture" },
-        finalAssertions: [{ kind: "visible", query: { role: "button" } }],
       }),
     );
     const result = await call(
@@ -411,7 +467,6 @@ describe("PiTaskSession", () => {
       session,
       request(1, "begin", {
         application: { name: "Fixture" },
-        finalAssertions: [{ kind: "visible", query: { role: "button" } }],
       }),
     );
     const result = await call(
@@ -446,7 +501,6 @@ describe("PiTaskSession", () => {
       session,
       request(1, "begin", {
         application: { name: "Fixture" },
-        finalAssertions: [{ kind: "visible", query: { role: "button" } }],
       }),
     );
     const failed = await call(
@@ -495,7 +549,6 @@ describe("PiTaskSession", () => {
         session,
         request(1, "begin", {
           application: { name: "Fixture" },
-          finalAssertions: [{ kind: "visible", query: { role: "button" } }],
         }),
       );
       const failed = await call(

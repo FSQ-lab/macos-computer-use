@@ -183,11 +183,11 @@ export const buildMacOSComputerUseClientForTesting = (
         retryDisposition: "notApplicable",
       });
     const parsed = options.finalAssertions.map((item) => AssertionSpecSchema.safeParse(item));
-    if (parsed.length === 0 || parsed.some((item) => !item.success))
+    if ((!applicationInput && parsed.length === 0) || parsed.some((item) => !item.success))
       return err({
         code: "InvalidScenario",
         phase: "action",
-        message: "At least one valid final assertion is required.",
+        message: "Configured Runs require at least one valid final assertion.",
         retryDisposition: "notApplicable",
       });
     const assertions = parsed.flatMap((item) => (item.success ? [item.data] : []));
@@ -205,6 +205,7 @@ export const buildMacOSComputerUseClientForTesting = (
       async (run) =>
         callback({
           leaseId: run.leaseId,
+          currentObservation: () => run.currentObservation(),
           observe: () => run.observe(),
           assert: async (assertion) => {
             const parsed = AssertionSpecSchema.safeParse(assertion);
@@ -225,6 +226,17 @@ export const buildMacOSComputerUseClientForTesting = (
                   code: "InvalidScenario",
                   phase: "observe",
                   message: "Assertion is invalid.",
+                  retryDisposition: "safe",
+                });
+          },
+          freezeFinalAssertions: async (assertions) => {
+            const parsed = assertions.map((item) => AssertionSpecSchema.safeParse(item));
+            return parsed.length > 0 && parsed.every((item) => item.success)
+              ? run.freezeFinalAssertions(parsed.map((item) => item.data))
+              : err({
+                  code: "InvalidScenario",
+                  phase: "action",
+                  message: "Final assertions are invalid.",
                   retryDisposition: "safe",
                 });
           },

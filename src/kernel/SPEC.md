@@ -18,6 +18,8 @@ Kernel exposes an internal application service consumed only by Client. It accep
 
 Environment lifecycle is `allocating`, `active`, `cleaningUp`, `closed`, or `failed`. Readiness is a separate aggregate of VM, Guest, Driver, and App probes with result time, expiry, duration, and diagnostic reference. Activation always requires every required probe to be successful and fresh. Configured Scenario/CLI operations continue to require aggregate freshness. A Pi-selected interactive Run instead treats the successful activation snapshot as startup readiness: subsequent operations are bounded by the exclusive Run lease and total deadline, while DesktopPort calls revalidate the live session, frozen application identity, owned window, and foreground state before provider work. An expired startup probe alone does not end a Pi-selected interactive Run.
 
+A Pi-selected interactive Run begins without final assertions and returns its already captured initial Observation to the supervised runner. Its internal Run handle accepts one nonempty validated `freezeFinalAssertions` operation. Freeze is permitted exactly once, clones the assertions, appends durable `FinalAssertionsFrozen` Evidence, and makes them immutable for all later completion probes and final verdict evaluation. A second freeze fails without changing state. Normal finish without a successful freeze fails before cleanup; abort and fail-dead cleanup remain available. Configured Public Client, CLI, and Scenario Runs retain their existing predeclared-final-assertion contract.
+
 VM, Guest, session, or selected-application reconstruction increments generation and invalidates all prior WindowRefs, Observations, and ElementRefs. Each Run has one exclusive lease. Expired/revoked/mismatched leases reject new operations before dispatch but never suppress finalization or cleanup.
 
 After VM/Guest readiness, Kernel resolves the Run's ApplicationTarget through GuestPort. Zero or ambiguous matches fail before Appium/session creation. Kernel rejects the fixed protected bundle-ID denylist, freezes the allowed ApplicationDescriptor, and supplies it to DesktopPort. In this incremental version the selected application becomes callable only when readiness finds exactly one application-owned window; zero or multiple windows fail closed. Focus loss, system UI, another application, unknown windows, or permission prompts stop new business work; Kernel does not silently reactivate, switch, or operate them.
@@ -32,9 +34,9 @@ For each action Kernel serially performs:
 
 ```text
 validate lock, lease, generation, readiness, and latest observation
-capture/commit required before Observation and evaluate preconditions
+reuse the latest committed canonical Observation as before-Observation and evaluate preconditions
 resolve one unique ElementRef
-run Evidence preflight and commit required before artifacts
+run Evidence preflight
 append and fsync ActionPlanned
 dispatch exactly once through DesktopPort
 append validated ProviderReceipt
@@ -43,6 +45,8 @@ evaluate frozen assertions
 derive ActionResult
 append the Step projection events
 ```
+
+Readiness, explicit observe, and every successful action-after capture already commit screenshot/UI-snapshot artifacts and an ObservationCaptured event. The immediately following action reuses that exact Observation and ArtifactRefs rather than issuing another full Provider capture. Before dispatch, Adapter live foreground, unique-window, hierarchy-aware target rebind, visibility, and geometry checks remain mandatory. Scenario/CLI and Pi-managed Runs share this rule.
 
 Any failure before dispatch is `notDispatched`. A crash after durable ActionPlanned and before a reliable receipt leaves dispatch/outcome unknown and retry disposition `reconcileRequired`. Provider success without an independent passing assertion remains unverified. After-capture failure preserves known Provider facts, marks verification unverifiable and Evidence incomplete, stops further Scenario work, and continues bounded finalization.
 
