@@ -22,8 +22,7 @@ macos-computer-use evidence export <run-id> <destination>
 ```
 
 - Default doctor is read-only: it checks Host platform/architecture, Node/Tart compatibility, configuration, state/Evidence directory access, lock state, and cached image metadata. It does not create a VM, start Appium, change settings, or trigger permission workflows.
-- `doctor --deep` explicitly creates one Diagnostic Run, verifies Guest Agent/Appium/Mac2 session/base Observation and cleanup, performs no input action, and records Evidence. It never installs or fixes prerequisites.
-- `run` parses one strict Scenario JSON through Contracts and executes only through Client.
+- `doctor --deep` and `run` retain their current configured-AUT and Scenario v1 behavior in this increment. ApplicationTarget is Pi-only.
 - `recover` invokes the same conservative Kernel path used at startup and never resumes business actions.
 - `runs list/show` use verified Host Evidence projections.
 - `evidence export` verifies integrity and writes a relative-path Run package to an explicitly supplied destination; it does not expose internal absolute paths.

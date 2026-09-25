@@ -1,1 +1,1 @@
-export { TartAdapter } from "./tart-adapter.js";
+export { TartAdapter, tartRunArguments } from "./tart-adapter.js";

@@ -1,4 +1,6 @@
 export * from "./actions.js";
+export { ApplicationTargetSchema } from "./application.js";
+export type { ApplicationTarget } from "./application.js";
 export * from "./config.js";
 export * from "./evidence.js";
 export * from "./ids.js";

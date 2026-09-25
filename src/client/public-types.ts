@@ -11,6 +11,7 @@ import type {
   ElementSummary,
   LeaseId,
   Observation,
+  OperationError,
   OperationResult,
   RunId,
   RunResult,
@@ -21,6 +22,7 @@ export interface ClientRun {
   readonly leaseId: LeaseId;
   observe(): Promise<OperationResult<Observation>>;
   assert(assertion: AssertionSpec): Promise<OperationResult<AssertionResult>>;
+  assertCurrent(assertion: AssertionSpec): Promise<OperationResult<AssertionResult>>;
   query(query: ElementQuery): OperationResult<ElementRef>;
   queryPage(query: ElementQuery, options?: { offset?: number; limit?: number }): OperationResult<QueryPage>;
   compact(): OperationResult<string>;
@@ -35,6 +37,7 @@ export interface ClientRun {
       after?: Observation;
       artifacts?: ArtifactDescriptor[];
       evidenceComplete?: boolean;
+      failure?: OperationError;
     }>
   >;
 }

@@ -13,6 +13,7 @@ import {
   type EvidencePort,
   type Observation,
   type ObservationId,
+  type OperationError,
   type OperationId,
   type OperationResult,
   type ProviderReceipt,
@@ -23,7 +24,7 @@ import {
   type EventHook,
 } from "../contracts/index.js";
 import type { Clock, IdGenerator } from "./runtime.js";
-import { StageTimeoutError, withStageSignal } from "./timeout.js";
+import { retrySafe, StageTimeoutError, withStageSignal } from "./timeout.js";
 import { deliverHooks } from "./hook-pipeline.js";
 
 export type TransactionContext = {
@@ -45,6 +46,7 @@ export type TransactionOutput = {
   after?: Observation;
   artifacts?: ArtifactDescriptor[];
   evidenceComplete?: boolean;
+  failure?: OperationError;
 };
 
 export class ActionTransaction {
@@ -74,6 +76,10 @@ export class ActionTransaction {
     private readonly ids: IdGenerator,
     private readonly timeouts: { actionMs: number; observeMs: number; assertionMs: number },
     private readonly hooks: readonly EventHook[] = [],
+    private readonly observationRetry: { maxAttempts: number; backoffMs: number } = {
+      maxAttempts: 1,
+      backoffMs: 0,
+    },
   ) {}
 
   async execute(
@@ -117,23 +123,7 @@ export class ActionTransaction {
     const operationId = this.ids.next("operation") as OperationId;
     const actionId = this.ids.next("action") as ActionId;
     let sequence = context.sequence;
-    const beforeCaptured = await withStageSignal(
-      budget(this.timeouts.observeMs),
-      signal,
-      (stageSignal) =>
-        this.desktop.observe(
-          {
-            runId: context.runId,
-            generation: context.generation,
-            observationId: this.ids.next("observation") as ObservationId,
-            sessionId: context.sessionId,
-            windowId: context.windowId,
-            ...(context.window ? { window: context.window } : {}),
-          },
-          stageSignal,
-        ),
-      this.clock,
-    );
+    const beforeCaptured = await this.#observeForAction(context, signal, false);
     if (!beforeCaptured.ok) return beforeCaptured;
     const progress = { sequence, artifacts: [] as ArtifactDescriptor[] };
     const beforeArtifacts = await this.#commitObservation(
@@ -142,6 +132,7 @@ export class ActionTransaction {
       sequence,
       progress,
       signal,
+      false,
     );
     if (!beforeArtifacts.ok)
       return this.#output({
@@ -156,6 +147,7 @@ export class ActionTransaction {
         evidenceComplete: false,
       });
     sequence = beforeArtifacts.value.sequence;
+    let transactionEvidenceComplete = beforeArtifacts.value.screenshotError === undefined;
     const retainedArtifacts = [...beforeArtifacts.value.artifacts];
     for (const assertion of context.preconditions ?? []) {
       const evaluated = await withStageSignal(
@@ -263,7 +255,9 @@ export class ActionTransaction {
               ],
             }
           : {}),
-        ...(!resultRecorded.ok || extra.evidenceComplete === false ? { evidenceComplete: false } : {}),
+        ...(!resultRecorded.ok || extra.evidenceComplete === false || !transactionEvidenceComplete
+          ? { evidenceComplete: false }
+          : {}),
       });
     };
     if (
@@ -349,7 +343,9 @@ export class ActionTransaction {
         receipt.error.dispatch === "notDispatched"
           ? "safe"
           : receipt.error.dispatch === "dispatched"
-            ? "unsafe"
+            ? receipt.error.retryDisposition === "reconcileRequired"
+              ? "reconcileRequired"
+              : "unsafe"
             : "reconcileRequired";
       return finish(
         {
@@ -361,6 +357,7 @@ export class ActionTransaction {
         {
           artifacts: retainedArtifacts,
           ...(after ? { after } : {}),
+          failure: receipt.error,
           ...(!failureEvidenceComplete ? { evidenceComplete: false } : {}),
         },
       );
@@ -378,33 +375,7 @@ export class ActionTransaction {
         artifacts: retainedArtifacts,
         evidenceComplete: false,
       });
-    const observed = await withStageSignal(
-      Math.max(
-        0,
-        Math.min(this.timeouts.observeMs, (context.deadlineMs ?? Infinity) - this.clock.monotonicMs()),
-      ),
-      signal,
-      (stageSignal) =>
-        this.desktop.observe(
-          {
-            runId: context.runId,
-            generation: context.generation,
-            observationId: this.ids.next("observation") as ObservationId,
-            sessionId: context.sessionId,
-            windowId: context.windowId,
-            ...(context.window ? { window: context.window } : {}),
-          },
-          stageSignal,
-        ),
-      this.clock,
-    ).catch(() =>
-      err({
-        code: "EvidenceIncomplete",
-        phase: "observe",
-        message: "After Observation could not be captured.",
-        retryDisposition: "notApplicable",
-      }),
-    );
+    const observed = await this.#observeForAction(context, signal, true);
     if (!observed.ok)
       return finish(
         {
@@ -418,20 +389,25 @@ export class ActionTransaction {
                 ? "safe"
                 : "unsafe",
         },
-        { artifacts: retainedArtifacts, evidenceComplete: false },
+        { artifacts: retainedArtifacts, evidenceComplete: false, failure: observed.error },
       );
-    const screenshot = await persist((evidenceSignal) =>
-      this.evidence.commitArtifact(
-        {
-          runId: context.runId,
-          type: "window-screenshot",
-          mimeType: "image/png",
-          sensitivity: "potentiallySensitive",
-          bytes: observed.value.screenshot,
-        },
-        evidenceSignal,
-      ),
-    );
+    const screenshot = observed.value.screenshot
+      ? await persist((evidenceSignal) =>
+          this.evidence.commitArtifact(
+            {
+              runId: context.runId,
+              type:
+                observed.value.observation.screenshotScope === "display"
+                  ? "display-screenshot"
+                  : "window-screenshot",
+              mimeType: "image/png",
+              sensitivity: "potentiallySensitive",
+              bytes: observed.value.screenshot as Uint8Array,
+            },
+            evidenceSignal,
+          ),
+        )
+      : undefined;
     const snapshot = await persist((evidenceSignal) =>
       this.evidence.commitArtifact(
         {
@@ -444,9 +420,10 @@ export class ActionTransaction {
         evidenceSignal,
       ),
     );
-    if (screenshot.ok) retainedArtifacts.push(screenshot.value);
+    if (screenshot?.ok) retainedArtifacts.push(screenshot.value);
     if (snapshot.ok) retainedArtifacts.push(snapshot.value);
-    if (!screenshot.ok || !snapshot.ok)
+    if (!observed.value.screenshot) transactionEvidenceComplete = false;
+    if (!snapshot.ok || (screenshot !== undefined && !screenshot.ok))
       return finish(
         {
           dispatch: receipt.value.dispatch,
@@ -461,7 +438,7 @@ export class ActionTransaction {
         },
         { artifacts: retainedArtifacts, evidenceComplete: false },
       );
-    for (const artifact of [screenshot.value, snapshot.value]) {
+    for (const artifact of [...(screenshot?.ok ? [screenshot.value] : []), snapshot.value]) {
       const committed = await this.#append(
         context,
         sequence + 1,
@@ -482,7 +459,7 @@ export class ActionTransaction {
     }
     const after: Observation = {
       ...observed.value.observation,
-      screenshot: this.#artifactRef(screenshot.value),
+      ...(screenshot?.ok ? { screenshot: this.#artifactRef(screenshot.value) } : {}),
       uiSnapshot: this.#artifactRef(snapshot.value),
     };
     const observationEvent = await this.#append(
@@ -491,6 +468,7 @@ export class ActionTransaction {
       "ObservationCaptured",
       {
         observationId: after.observationId,
+        screenshotScope: after.screenshotScope,
         coverage: after.coverage,
         screenshot: after.screenshot,
         uiSnapshot: after.uiSnapshot,
@@ -503,7 +481,11 @@ export class ActionTransaction {
         artifacts: retainedArtifacts,
         evidenceComplete: false,
       });
-    const committedArtifacts = [...beforeArtifacts.value.artifacts, screenshot.value, snapshot.value];
+    const committedArtifacts = [
+      ...beforeArtifacts.value.artifacts,
+      ...(screenshot?.ok ? [screenshot.value] : []),
+      snapshot.value,
+    ];
     if (receipt.value.dispatch !== "dispatched" || receipt.value.outcome !== "succeeded") {
       const disposition =
         receipt.value.dispatch === "notDispatched"
@@ -580,17 +562,82 @@ export class ActionTransaction {
         verification,
         retryDisposition: "unsafe",
       },
-      { after, artifacts: committedArtifacts },
+      {
+        after,
+        artifacts: committedArtifacts,
+        ...(!screenshot ? { evidenceComplete: false, failure: observed.value.screenshotError } : {}),
+      },
     );
   }
 
   #usesLatestObservation(action: DesktopAction, expected: string): boolean {
-    if (action.kind === "pressKey") return true;
+    if (action.kind === "pressKey" || action.kind === "typeText") return true;
     if (action.kind === "drag")
       return action.from.element.observationId === expected && action.to.element.observationId === expected;
-    if (action.kind === "appendText" || action.kind === "replaceText")
-      return action.target.observationId === expected;
     return "element" in action.target && action.target.element.observationId === expected;
+  }
+
+  async #observeForAction(
+    context: TransactionContext,
+    signal: AbortSignal,
+    settleBeforeFirst: boolean,
+  ): Promise<Awaited<ReturnType<DesktopPort["observe"]>>> {
+    const timeoutMs = Math.max(
+      0,
+      Math.min(this.timeouts.observeMs, (context.deadlineMs ?? Infinity) - this.clock.monotonicMs()),
+    );
+    let earliestError: OperationError | undefined;
+    return withStageSignal(
+      timeoutMs,
+      signal,
+      async (stageSignal) => {
+        if (settleBeforeFirst && this.observationRetry.backoffMs > 0)
+          await this.clock.sleep(this.observationRetry.backoffMs, stageSignal);
+        const observed = await retrySafe(
+          this.observationRetry,
+          stageSignal,
+          async () => {
+            const result = await this.desktop.observe(
+              {
+                runId: context.runId,
+                generation: context.generation,
+                observationId: this.ids.next("observation") as ObservationId,
+                sessionId: context.sessionId,
+                windowId: context.windowId,
+                ...(context.window ? { window: context.window } : {}),
+              },
+              stageSignal,
+            );
+            earliestError ??= result.ok ? result.value.screenshotError : result.error;
+            return result;
+          },
+          (result) => {
+            const error = result.ok ? result.value.screenshotError : result.error;
+            return (
+              error !== undefined &&
+              ["ProviderFailure", "ProviderTimeout", "SessionUnavailable", "SnapshotIncomplete"].includes(
+                error.code,
+              )
+            );
+          },
+          this.clock,
+        );
+        if (!earliestError) return observed;
+        if (!observed.ok) return err(earliestError);
+        if (!observed.value.screenshotError) return observed;
+        return ok({ ...observed.value, screenshotError: earliestError });
+      },
+      this.clock,
+    ).catch(() =>
+      earliestError
+        ? err(earliestError)
+        : err({
+            code: "ProviderTimeout",
+            phase: "observe",
+            message: "After Observation retry budget expired.",
+            retryDisposition: "safe",
+          }),
+    );
   }
 
   #artifactRef(descriptor: { artifactId: string; sha256: string }): ArtifactRef {
@@ -617,8 +664,14 @@ export class ActionTransaction {
     initialSequence: number,
     progress: { sequence: number; artifacts: ArtifactDescriptor[] },
     signal?: AbortSignal,
+    requireScreenshot = true,
   ): Promise<
-    OperationResult<{ observation: Observation; artifacts: ArtifactDescriptor[]; sequence: number }>
+    OperationResult<{
+      observation: Observation;
+      artifacts: ArtifactDescriptor[];
+      sequence: number;
+      screenshotError?: OperationError;
+    }>
   > {
     let sequence = initialSequence;
     const remaining = (): number =>
@@ -630,25 +683,39 @@ export class ActionTransaction {
             this.clock.monotonicMs(),
         ),
       );
-    const screenshot = await withStageSignal(
-      remaining(),
-      signal ?? new AbortController().signal,
-      (evidenceSignal) =>
-        this.evidence.commitArtifact(
-          {
-            runId: context.runId,
-            type: "window-screenshot",
-            mimeType: "image/png",
-            sensitivity: "potentiallySensitive",
-            bytes: captured.screenshot,
-          },
-          evidenceSignal,
-        ),
-      this.clock,
-      false,
-    );
-    if (!screenshot.ok) return screenshot;
-    progress.artifacts.push(screenshot.value);
+    if (!captured.screenshot && requireScreenshot)
+      return captured.screenshotError
+        ? err(captured.screenshotError)
+        : err({
+            code: "EvidenceIncomplete",
+            phase: "observe",
+            message: "Required before-Observation screenshot is unavailable.",
+            retryDisposition: "notApplicable",
+          });
+    const screenshot = captured.screenshot
+      ? await withStageSignal(
+          remaining(),
+          signal ?? new AbortController().signal,
+          (evidenceSignal) =>
+            this.evidence.commitArtifact(
+              {
+                runId: context.runId,
+                type:
+                  captured.observation.screenshotScope === "display"
+                    ? "display-screenshot"
+                    : "window-screenshot",
+                mimeType: "image/png",
+                sensitivity: "potentiallySensitive",
+                bytes: captured.screenshot as Uint8Array,
+              },
+              evidenceSignal,
+            ),
+          this.clock,
+          false,
+        )
+      : undefined;
+    if (screenshot && !screenshot.ok) return screenshot;
+    if (screenshot?.ok) progress.artifacts.push(screenshot.value);
     const snapshot = await withStageSignal(
       remaining(),
       signal ?? new AbortController().signal,
@@ -668,7 +735,7 @@ export class ActionTransaction {
     );
     if (!snapshot.ok) return snapshot;
     progress.artifacts.push(snapshot.value);
-    for (const artifact of [screenshot.value, snapshot.value]) {
+    for (const artifact of [...(screenshot?.ok ? [screenshot.value] : []), snapshot.value]) {
       const event = await this.#append(
         context,
         sequence + 1,
@@ -686,15 +753,28 @@ export class ActionTransaction {
     }
     const observation: Observation = {
       ...captured.observation,
-      screenshot: this.#artifactRef(screenshot.value),
+      ...(screenshot?.ok ? { screenshot: this.#artifactRef(screenshot.value) } : {}),
       uiSnapshot: this.#artifactRef(snapshot.value),
     };
+    if (!screenshot && captured.screenshotError) {
+      const failed = await this.#append(
+        context,
+        sequence + 1,
+        "EvidenceCollectionFailed",
+        { stage: "screenshot", code: captured.screenshotError.code },
+        signal,
+      );
+      if (!failed.ok) return failed;
+      sequence = failed.value;
+      progress.sequence = sequence;
+    }
     const event = await this.#append(
       context,
       sequence + 1,
       "ObservationCaptured",
       {
         observationId: observation.observationId,
+        screenshotScope: observation.screenshotScope,
         coverage: observation.coverage,
         screenshot: observation.screenshot,
         uiSnapshot: observation.uiSnapshot,
@@ -704,7 +784,12 @@ export class ActionTransaction {
     if (!event.ok) return event;
     sequence = event.value;
     progress.sequence = sequence;
-    return ok({ observation, artifacts: [screenshot.value, snapshot.value], sequence });
+    return ok({
+      observation,
+      artifacts: [...(screenshot?.ok ? [screenshot.value] : []), snapshot.value],
+      sequence,
+      ...(captured.screenshotError ? { screenshotError: captured.screenshotError } : {}),
+    });
   }
 
   #append(

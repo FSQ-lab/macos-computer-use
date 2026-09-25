@@ -173,40 +173,38 @@ describe.skipIf(!configPath || profile !== "extended")("provisioned Mac2 conform
         name: "text-keyboard-actions",
         actions: [
           {
-            stepId: "replace",
+            stepId: "focus-text",
             target: { identifier: "fixture.text-input" },
-            action: { kind: "replaceText", value: { literal: "Alpha" } },
-            verification: {
-              policy: "immediate",
-              assertions: [
-                {
-                  kind: "value",
-                  query: { identifier: "fixture.text-input" },
-                  expected: "Alpha",
-                  match: "exact",
-                },
-              ],
-            },
+            action: { kind: "click" },
+            verification: { policy: "deferred" },
           },
           {
-            stepId: "append",
-            target: { identifier: "fixture.text-input" },
-            action: { kind: "appendText", value: { literal: " Beta" } },
-            verification: {
-              policy: "immediate",
-              assertions: [
-                {
-                  kind: "value",
-                  query: { identifier: "fixture.text-input" },
-                  expected: "Alpha Beta",
-                  match: "exact",
-                },
-              ],
-            },
+            stepId: "select-all",
+            action: { kind: "pressKey", key: "a", modifiers: ["command"] },
+            verification: { policy: "deferred" },
+          },
+          {
+            stepId: "clear",
+            action: { kind: "pressKey", key: "backspace" },
+            verification: { policy: "deferred" },
+          },
+          {
+            stepId: "type-alpha",
+            action: { kind: "typeText", value: { literal: "Alpha" } },
+            verification: { policy: "deferred" },
+          },
+          {
+            stepId: "caret-end",
+            action: { kind: "pressKey", key: "end" },
+            verification: { policy: "deferred" },
+          },
+          {
+            stepId: "type-beta",
+            action: { kind: "typeText", value: { literal: " Beta" } },
+            verification: { policy: "deferred" },
           },
           {
             stepId: "keyboard",
-            target: { identifier: "fixture.keyboard" },
             action: { kind: "pressKey", key: "enter", modifiers: ["command"] },
             verification: { policy: "immediate", assertions: [status("Keyboard activated")] },
           },

@@ -14,12 +14,12 @@ Own the package's Public Client API and sole production composition root. Client
 
 The package public export provides `createMacOSComputerUseClient(config)` and public Contract types/schemas. The client exposes:
 
-- structured `run(options, callback)` lifecycle;
+- existing structured `run(options, callback)` lifecycle for configured-AUT callers, plus an internal Pi-run entry that supplies ApplicationTarget and final assertions;
 - Run-scope `observe`, compact/query/expand, and typed action/assertion operations;
 - read-only Run list/show and Evidence export operations;
 - explicit recovery and doctor application operations used by CLI.
 
-`run` obtains the lock, performs startup recovery, allocates/readies the environment, invokes the callback with one lease-bound Run handle, freezes the handle on callback completion/failure/cancel, finalizes Evidence, cleans resources, and returns the full OperationResult/RunResult. A closed handle returns `RunClosed`. Client does not expose `createEnvironment`, raw session, Port, or Adapter access.
+Existing public `run` and `runScenario` retain configured-AUT behavior. The private Pi runner invokes a Client application-target entry that validates ApplicationTarget, then follows the same lock, recovery, allocation, readiness, callback, finalization, Evidence, and cleanup lifecycle while overriding only the selected AUT identity for that Run. Pi performs the interactive target confirmation before calling Client. A closed handle returns `RunClosed`. Client and Pi never expose resolved bundle ID or application path.
 
 ## Composition Root
 
@@ -29,7 +29,7 @@ Tests may use the internal, unexported Client construction boundary; determinist
 
 ## Data And State Flow
 
-Untrusted configuration and public operation inputs parse through Contracts schemas. Client returns logical IDs and references only. Effective configuration is frozen at Run start and handed to Kernel for sanitized Evidence projection. Public Client never returns Host absolute paths, Guest endpoints, Provider-native IDs, or secret values.
+Untrusted configuration, Pi ApplicationTarget, Scenario, and operation inputs parse through Contracts schemas. Configured-AUT callers remain unchanged. For Pi-managed Runs, the resolved ApplicationDescriptor is frozen in Kernel state but is not added to a new public response or persisted snapshot schema in this increment. Client/Pi never return resolved bundle ID or application path.
 
 ## Internal Structure
 
@@ -61,4 +61,4 @@ Tests cover public exports, strict config parsing, composition version failure b
 
 ## Explicit AI Visual Evaluation
 
-AI visual evaluation is disabled by default. The Client factory accepts an optional caller-injected visual evaluator separately from serializable GatewayConfig; it is not a provider override. Only a predeclared aiVisual assertion with accepted=true may invoke it. It receives a copy of the current Observation window screenshot, logical observation identity and goal, plus cancellation. Its model identity and strict passed/failed/unverifiable response are validated. The result records the model and screenshot ArtifactRef with the Observation; missing, stale, cancelled or malformed evaluation is unverifiable. No model service, credential, upload destination or background evaluation is inferred.
+AI visual evaluation is disabled by default. The Client factory accepts an optional caller-injected visual evaluator separately from serializable GatewayConfig; it is not a provider override. Only a predeclared aiVisual assertion with accepted=true may invoke it. It receives a copy of the current Observation display screenshot, logical observation identity and goal, plus cancellation. Its model identity and strict passed/failed/unverifiable response are validated. The result records the model and screenshot ArtifactRef with the Observation; missing, stale, cancelled or malformed evaluation is unverifiable. No model service, credential, upload destination or background evaluation is inferred.

@@ -1,8 +1,16 @@
 import type { DesktopAction, AssertionSpec } from "./actions.js";
+import type { ApplicationDescriptor, ApplicationTarget } from "./application.js";
 import type { ArtifactDescriptor, EvidenceEvent, ManagedResourceRecord, RunManifest } from "./evidence.js";
 import type { ElementQuery, ElementRef, ElementSummary, Observation, QueryPage } from "./observation.js";
 import type { ElementId, OperationId, RunId } from "./ids.js";
-import type { OperationResult, ProbeResult, ProviderReceipt, RunResult, VmStatus } from "./results.js";
+import type {
+  OperationError,
+  OperationResult,
+  ProbeResult,
+  ProviderReceipt,
+  RunResult,
+  VmStatus,
+} from "./results.js";
 import type {
   ArtifactCommitRequest,
   CloneRequest,
@@ -39,6 +47,11 @@ export interface GuestPort {
     rules: readonly { cidr: string; ports: readonly number[]; protocol: "tcp" | "udp" }[],
     signal: AbortSignal,
   ): Promise<OperationResult<ProviderReceipt>>;
+  resolveApplication(
+    resourceId: string,
+    target: ApplicationTarget,
+    signal: AbortSignal,
+  ): Promise<OperationResult<ApplicationDescriptor>>;
   startAppium(
     resourceId: string,
     signal: AbortSignal,
@@ -58,7 +71,8 @@ export interface DesktopPort {
   ): Promise<
     OperationResult<{
       observation: Omit<Observation, "screenshot" | "uiSnapshot">;
-      screenshot: Uint8Array;
+      screenshot?: Uint8Array;
+      screenshotError?: OperationError;
       snapshot: Uint8Array;
     }>
   >;

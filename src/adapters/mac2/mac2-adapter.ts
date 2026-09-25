@@ -20,6 +20,7 @@ import {
   type ElementQuery,
   type ElementSummary,
   type Observation,
+  type OperationError,
   type OperationId,
   type OperationResult,
   type ProviderReceipt,
@@ -33,9 +34,20 @@ import {
 } from "../../contracts/index.js";
 
 type JsonObject = Record<string, unknown>;
+type ProviderErrorCategory =
+  | "unsupportedCommand"
+  | "invalidArgument"
+  | "invalidElementState"
+  | "elementNotInteractable"
+  | "staleElement"
+  | "noSuchElement"
+  | "invalidSession"
+  | "timeout"
+  | "transport"
+  | "providerError";
 class WebDriverFailure extends Error {
-  constructor(readonly providerCode: string) {
-    super(`webdriver:${providerCode}`);
+  constructor(readonly category: ProviderErrorCategory) {
+    super(`webdriver:${category}`);
   }
 }
 type NativeLocator = {
@@ -54,6 +66,28 @@ type NativeLocator = {
   height?: number;
 };
 const W3C_ELEMENT = "element-6066-11e4-a52e-4f735466cecf";
+const NEW_COMMAND_TIMEOUT_SECONDS = 3_000;
+const NEW_COMMAND_TIMEOUT_MS = NEW_COMMAND_TIMEOUT_SECONDS * 1_000;
+const PNG_SIGNATURE = new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
+const providerErrorCategory = (value: string, message?: string): ProviderErrorCategory => {
+  const normalized = value.trim().toLocaleLowerCase();
+  const normalizedMessage = message?.trim().toLocaleLowerCase() ?? "";
+  if (
+    normalizedMessage.includes("process is not running") ||
+    normalizedMessage.includes("process has exited") ||
+    normalizedMessage.includes("server process is unavailable")
+  )
+    return "invalidSession";
+  if (normalized === "unsupported operation" || normalized === "unknown command") return "unsupportedCommand";
+  if (normalized === "invalid argument") return "invalidArgument";
+  if (normalized === "invalid element state") return "invalidElementState";
+  if (normalized === "element not interactable") return "elementNotInteractable";
+  if (normalized === "stale element reference") return "staleElement";
+  if (normalized === "no such element") return "noSuchElement";
+  if (normalized === "invalid session id") return "invalidSession";
+  if (normalized.includes("timeout")) return "timeout";
+  return "providerError";
+};
 const asObject = (value: unknown): JsonObject | undefined =>
   typeof value === "object" && value !== null && !Array.isArray(value) ? (value as JsonObject) : undefined;
 const xpathLiteral = (value: string): string =>
@@ -122,6 +156,7 @@ export class Mac2DesktopAdapter implements DesktopPort {
               platformName: "mac",
               "appium:automationName": "Mac2",
               "appium:bundleId": request.bundleId,
+              "appium:newCommandTimeout": NEW_COMMAND_TIMEOUT_SECONDS,
               ...(request.arguments ? { "appium:arguments": request.arguments } : {}),
               ...(request.environment ? { "appium:environment": request.environment } : {}),
             },
@@ -144,7 +179,9 @@ export class Mac2DesktopAdapter implements DesktopPort {
       const automationName = capabilities?.["appium:automationName"] ?? capabilities?.automationName;
       if (automationName !== undefined && automationName !== "Mac2")
         throw new Error("incompatible automation backend");
-      const source = await this.#sessionRequest("GET", "/source", undefined, signal);
+      const timeouts = asObject((await this.#sessionRequest("GET", "/timeouts", undefined, signal)).value);
+      if (timeouts?.command !== NEW_COMMAND_TIMEOUT_MS) throw new Error("incompatible command timeout");
+      const source = await this.#pageSource(signal);
       await this.#requireForeground(signal);
       if (typeof source.value !== "string" || !this.#windowMatches(source.value, request.window))
         throw new Error("window readiness");
@@ -198,30 +235,49 @@ export class Mac2DesktopAdapter implements DesktopPort {
     request: Parameters<DesktopPort["observe"]>[0],
     signal: AbortSignal,
   ): ReturnType<DesktopPort["observe"]> {
+    let stage = "requestValidation";
     try {
       request = ObserveRequestSchema.parse(request);
-      const sourceResponse = await this.#sessionRequest("GET", "/source", undefined, signal);
+      stage = "pageSource";
+      const sourceResponse = await this.#pageSource(signal);
+      stage = "foreground";
       await this.#requireForeground(signal);
-      const windowElementId = await this.#resolveWindow(request.window ?? this.#windowQuery, signal);
-      const screenshotResponse = await this.#sessionRequest(
-        "GET",
-        `/element/${windowElementId}/screenshot`,
-        undefined,
-        signal,
-      );
-      if (typeof sourceResponse.value !== "string" || typeof screenshotResponse.value !== "string")
-        throw new Error("invalid observation");
+      stage = "windowResolution";
+      await this.#resolveWindow(request.window ?? this.#windowQuery, signal);
+      stage = "windowOwnership";
+      if (typeof sourceResponse.value !== "string") throw new Error("invalid observation");
       const selectedWindow = request.window ?? this.#windowQuery;
       if (!selectedWindow || !this.#windowMatches(sourceResponse.value, selectedWindow))
         throw new Error("window not found");
-      const screenshot = Buffer.from(screenshotResponse.value, "base64");
-      if (screenshot.toString("base64") !== screenshotResponse.value || screenshot.byteLength === 0)
-        throw new Error("invalid screenshot");
+      stage = "snapshotParse";
       const parsed = this.#parseElements(sourceResponse.value, request.observationId, selectedWindow);
       this.#windowQuery = selectedWindow;
       const elements = parsed.elements.map((element) => this.#sanitizeElement(element));
       this.#allElements = parsed.allElements.map((element) => this.#sanitizeElement(element));
-      this.#visualScreenshot = { observationId: request.observationId, bytes: new Uint8Array(screenshot) };
+      let screenshotScope: "display" | "unavailable" = "display";
+      let screenshot: Uint8Array | undefined;
+      let screenshotError: OperationError | undefined;
+      stage = "displayScreenshot";
+      try {
+        const screenshotResponse: JsonObject = { value: await this.#mainDisplayScreenshot(signal) };
+        if (typeof screenshotResponse.value !== "string") throw new Error("invalid observation");
+        const decoded = Buffer.from(screenshotResponse.value, "base64");
+        if (decoded.toString("base64") !== screenshotResponse.value || decoded.byteLength === 0)
+          throw new Error("invalid screenshot");
+        if (
+          decoded.byteLength < PNG_SIGNATURE.byteLength ||
+          !PNG_SIGNATURE.every((byte, index) => decoded[index] === byte)
+        )
+          throw new Error("invalid screenshot png");
+        screenshot = new Uint8Array(decoded);
+      } catch (error) {
+        if (signal.aborted) throw signal.reason;
+        screenshotScope = "unavailable";
+        screenshotError = this.#observationError(error, stage);
+      }
+      this.#visualScreenshot = screenshot
+        ? { observationId: request.observationId, bytes: screenshot.slice() }
+        : undefined;
       const observation: Omit<Observation, "screenshot" | "uiSnapshot"> = {
         observationId: request.observationId,
         runId: request.runId,
@@ -230,6 +286,7 @@ export class Mac2DesktopAdapter implements DesktopPort {
         sessionId: request.sessionId,
         windowId: request.windowId,
         capturedAt: new Date().toISOString(),
+        screenshotScope,
         coverage: parsed.truncated ? "truncated" : "complete",
         ...(parsed.truncated ? { truncationReason: "elementLimit" } : {}),
         elements,
@@ -245,30 +302,19 @@ export class Mac2DesktopAdapter implements DesktopPort {
         JSON.stringify({
           schemaVersion: 1,
           observationId: request.observationId,
+          screenshotScope,
           coverage: parsed.truncated ? "truncated" : "complete",
           elements,
         }),
       );
-      return ok({ observation, screenshot, snapshot });
-    } catch (error) {
-      const detail = error instanceof Error ? error.message : "unknown";
-      const code = signal.aborted
-        ? "Cancelled"
-        : detail.includes("ambiguous window")
-          ? "AmbiguousWindowOwner"
-          : detail.includes("window not found") || detail.includes("not foreground")
-            ? "AppNotForeground"
-            : detail.includes("session")
-              ? "SessionUnavailable"
-              : detail.includes("unsafe xml")
-                ? "SnapshotIncomplete"
-                : "ProviderFailure";
-      return err({
-        code,
-        phase: "observe",
-        message: "Mac2 observation could not be captured.",
-        retryDisposition: "safe",
+      return ok({
+        observation,
+        ...(screenshot ? { screenshot } : {}),
+        ...(screenshotError ? { screenshotError } : {}),
+        snapshot,
       });
+    } catch (error) {
+      return err(this.#observationError(error, stage, signal));
     }
   }
 
@@ -288,24 +334,28 @@ export class Mac2DesktopAdapter implements DesktopPort {
         dispatch: "notDispatched",
       });
     action = parsedAction.data;
+    let stage = "contextValidation";
+    let dispatchedTextCodePoints = 0;
     try {
       this.#validateActionContext(action);
+      stage = "foreground";
       await this.#requireForeground(signal);
-      const source = await this.#sessionRequest("GET", "/source", undefined, signal);
+      stage = "pageSource";
+      const source = await this.#pageSource(signal);
       if (
         typeof source.value !== "string" ||
         !this.#windowQuery ||
         !this.#windowMatches(source.value, this.#windowQuery)
       )
         throw new Error("not foreground");
-      if (action.kind === "pressKey")
+      if (action.kind === "pressKey") {
+        stage = "keyDispatch";
         await this.#execute(
           "macos: keys",
           { keys: [{ key: this.#key(action.key), modifierFlags: this.#modifierFlags(action.modifiers) }] },
           signal,
         );
-      else if (action.kind === "appendText" || action.kind === "replaceText") {
-        const elementId = await this.#resolve(action.target, signal);
+      } else if (action.kind === "typeText") {
         const text = "literal" in action.value ? action.value.literal : undefined;
         if (text === undefined)
           return err({
@@ -315,9 +365,11 @@ export class Mac2DesktopAdapter implements DesktopPort {
             retryDisposition: "safe",
             dispatch: "notDispatched",
           });
-        if (action.kind === "replaceText")
-          await this.#sessionRequest("POST", `/element/${elementId}/value`, { text }, signal);
-        else await this.#execute("macos: keys", { keys: Array.from(text), elementId }, signal);
+        for (const codePoint of text) {
+          stage = "textDispatch";
+          await this.#execute("macos: keys", { keys: [codePoint] }, signal);
+          dispatchedTextCodePoints += 1;
+        }
       } else if (action.kind === "drag") {
         if (!this.#elementOriginActionsSupported)
           return err({
@@ -366,6 +418,7 @@ export class Mac2DesktopAdapter implements DesktopPort {
       );
     } catch (error) {
       const message = error instanceof Error ? error.message : "unknown";
+      const providerCategory = error instanceof WebDriverFailure ? error.category : undefined;
       const code = message.includes("not foreground")
         ? "AppNotForeground"
         : message.includes("geometry")
@@ -376,30 +429,38 @@ export class Mac2DesktopAdapter implements DesktopPort {
               ? "TargetAmbiguous"
               : message.includes("not found")
                 ? "TargetNotFound"
-                : message.includes("webdriver:unsupported operation") ||
-                    message.includes("webdriver:unknown command")
+                : providerCategory === "unsupportedCommand"
                   ? "UnsupportedAction"
-                  : message.includes("webdriver:invalid argument")
+                  : providerCategory === "invalidArgument"
                     ? "InvalidConfiguration"
-                    : message.includes("webdriver:timeout")
+                    : providerCategory === "timeout"
                       ? "ProviderTimeout"
-                      : signal.aborted
-                        ? "Cancelled"
-                        : "ProviderFailure";
+                      : providerCategory === "invalidSession"
+                        ? "SessionUnavailable"
+                        : providerCategory === "staleElement"
+                          ? "StaleElementRef"
+                          : providerCategory === "noSuchElement"
+                            ? "TargetNotFound"
+                            : signal.aborted
+                              ? "Cancelled"
+                              : "ProviderFailure";
       const beforeDispatch =
         code === "StaleElementRef" ||
         code === "TargetAmbiguous" ||
         code === "TargetNotFound" ||
         code === "AppNotForeground" ||
         code === "UnsupportedAction";
+      const partialTextDispatch = action.kind === "typeText" && dispatchedTextCodePoints > 0;
       return err({
         code,
         phase: "action",
         message: beforeDispatch
           ? "Mac2 target could not be resolved safely."
-          : "Mac2 action did not produce a reliable receipt.",
+          : providerCategory
+            ? `Mac2 ${action.kind} failed at ${stage} with provider category ${providerCategory}.`
+            : `Mac2 ${action.kind} failed at ${stage} without a reliable receipt.`,
         retryDisposition: beforeDispatch ? "safe" : "reconcileRequired",
-        dispatch: beforeDispatch ? "notDispatched" : "unknown",
+        dispatch: beforeDispatch ? "notDispatched" : partialTextDispatch ? "dispatched" : "unknown",
       });
     } finally {
       this.#context = undefined;
@@ -467,7 +528,7 @@ export class Mac2DesktopAdapter implements DesktopPort {
         elementId: matches[0].elementId,
       });
     };
-    if (action.kind === "pressKey") return ok(action);
+    if (action.kind === "pressKey" || action.kind === "typeText") return ok(action);
     if (action.kind === "drag") {
       const from = rebindRef(action.from.element);
       const to = rebindRef(action.to.element);
@@ -478,10 +539,6 @@ export class Mac2DesktopAdapter implements DesktopPort {
         from: { ...action.from, element: from.value },
         to: { ...action.to, element: to.value },
       });
-    }
-    if (action.kind === "appendText" || action.kind === "replaceText") {
-      const target = rebindRef(action.target);
-      return target.ok ? ok({ ...action, target: target.value }) : target;
     }
     if (!("element" in action.target))
       return err({
@@ -509,6 +566,7 @@ export class Mac2DesktopAdapter implements DesktopPort {
         !evaluator ||
         !AssertionSpecSchema.safeParse(assertion).success ||
         !screenshot ||
+        !observation.screenshot ||
         screenshot.observationId !== observation.observationId ||
         createHash("sha256").update(screenshot.bytes).digest("hex") !== observation.screenshot.sha256 ||
         this.#context?.observationId !== observation.observationId ||
@@ -670,11 +728,16 @@ export class Mac2DesktopAdapter implements DesktopPort {
     const visible = observation.elements.slice(0, 200);
     const coverage = observation.elements.length > 200 ? "partial" : observation.coverage;
     return [
-      `snapshot=${observation.observationId} window=${observation.windowId} coverage=${coverage}`,
-      ...visible.map(
-        (e) =>
-          `[${e.elementId}] ${e.role} ${JSON.stringify((e.name ?? e.label ?? e.value ?? "").slice(0, 120))}${e.enabled === undefined ? "" : e.enabled ? " enabled" : " disabled"}`,
-      ),
+      `snapshot=${observation.observationId} window=${observation.windowId} screenshotScope=${observation.screenshotScope} coverage=${coverage}`,
+      ...visible.map((e) => {
+        const primary =
+          [e.name, e.label, e.value].find((value) => value !== undefined && value.length > 0) ?? "";
+        const identifier =
+          e.identifier === undefined || e.identifier.length === 0
+            ? ""
+            : ` id=${JSON.stringify(e.identifier.slice(0, 500))}`;
+        return `[${e.elementId}] ${e.role} ${JSON.stringify(primary.slice(0, 120))}${identifier}${e.enabled === undefined ? "" : e.enabled ? " enabled" : " disabled"}`;
+      }),
       ...(observation.elements.length > 200
         ? [`... ${String(observation.elements.length - 200)} more elements`]
         : []),
@@ -833,14 +896,9 @@ export class Mac2DesktopAdapter implements DesktopPort {
       const expected = locator[field];
       if (expected !== undefined) predicates.push(`@${field}=${xpathLiteral(String(expected))}`);
     }
-    const value = `.//${locator.role}${predicates.length ? `[${predicates.join(" and ")}]` : ""}`;
-    const window = await this.#resolveWindow(this.#windowQuery, signal);
-    const response = await this.#sessionRequest(
-      "POST",
-      `/element/${encodeURIComponent(window)}/elements`,
-      { using, value },
-      signal,
-    );
+    await this.#resolveWindow(this.#windowQuery, signal);
+    const value = `${this.#windowXpath(this.#windowQuery)}//${locator.role}${predicates.length ? `[${predicates.join(" and ")}]` : ""}`;
+    const response = await this.#sessionRequest("POST", "/elements", { using, value }, signal);
     const elements = Array.isArray(response.value) ? response.value : [];
     if (elements.length !== 1) throw new Error(elements.length === 0 ? "not found" : "ambiguous");
     const item = asObject(elements[0]);
@@ -886,6 +944,24 @@ export class Mac2DesktopAdapter implements DesktopPort {
 
   async #resolveWindow(query: WindowQuery | undefined, signal: AbortSignal): Promise<string> {
     if (!query) throw new Error("ambiguous window");
+    const xpath = this.#windowXpath(query);
+    const response = await this.#sessionRequest(
+      "POST",
+      "/elements",
+      { using: "xpath", value: xpath },
+      signal,
+    );
+    const elements = Array.isArray(response.value) ? response.value : [];
+    if (elements.length !== 1)
+      throw new Error(elements.length === 0 ? "window not found" : "ambiguous window");
+    const item = asObject(elements[0]);
+    const id = typeof item?.[W3C_ELEMENT] === "string" ? item[W3C_ELEMENT] : undefined;
+    if (!id) throw new Error("window element id");
+    return id;
+  }
+
+  #windowXpath(query: WindowQuery | undefined): string {
+    if (!query) throw new Error("ambiguous window");
     const clauses: string[] = [];
     if (query.title) {
       const upper = "ABCDEFGHIJKLMNOPQRSTUVWXYZ";
@@ -902,24 +978,15 @@ export class Mac2DesktopAdapter implements DesktopPort {
     }
     if (query.role) {
       if (query.role !== "window") throw new Error("window not found");
-      clauses.push(`@type=${xpathLiteral("XCUIElementTypeWindow")}`);
     }
-    if (query.isMain !== undefined) clauses.push(`@main=${xpathLiteral(String(query.isMain))}`);
+    if (query.isMain !== undefined)
+      clauses.push(
+        query.isMain
+          ? `(@main=${xpathLiteral("true")} or @focused=${xpathLiteral("true")})`
+          : `not(@main=${xpathLiteral("true")}) and not(@focused=${xpathLiteral("true")})`,
+      );
     if (query.isModal !== undefined) clauses.push(`@modal=${xpathLiteral(String(query.isModal))}`);
-    const xpath = `//XCUIElementTypeWindow${clauses.length ? `[${clauses.join(" and ")}]` : ""}`;
-    const response = await this.#sessionRequest(
-      "POST",
-      "/elements",
-      { using: "xpath", value: xpath },
-      signal,
-    );
-    const elements = Array.isArray(response.value) ? response.value : [];
-    if (elements.length !== 1)
-      throw new Error(elements.length === 0 ? "window not found" : "ambiguous window");
-    const item = asObject(elements[0]);
-    const id = typeof item?.[W3C_ELEMENT] === "string" ? item[W3C_ELEMENT] : undefined;
-    if (!id) throw new Error("window element id");
-    return id;
+    return `//XCUIElementTypeWindow${clauses.length ? `[${clauses.join(" and ")}]` : ""}`;
   }
 
   #parseElements(
@@ -1008,11 +1075,17 @@ export class Mac2DesktopAdapter implements DesktopPort {
             : object.enabled === "false" || object.enabled === false
               ? { enabled: false }
               : {}),
-          ...(object.selected === "true" || object.selected === true
+          ...(role === "XCUIElementTypeCheckBox" &&
+          (object.value === "1" || object.value === 1 || object.value === true)
             ? { selected: true }
-            : object.selected === "false" || object.selected === false
+            : role === "XCUIElementTypeCheckBox" &&
+                (object.value === "0" || object.value === 0 || object.value === false)
               ? { selected: false }
-              : {}),
+              : object.selected === "true" || object.selected === true
+                ? { selected: true }
+                : object.selected === "false" || object.selected === false
+                  ? { selected: false }
+                  : {}),
           ...(object.focused === "true" || object.focused === true
             ? { focused: true }
             : object.focused === "false" || object.focused === false
@@ -1159,15 +1232,13 @@ export class Mac2DesktopAdapter implements DesktopPort {
   }
   #validateActionContext(action: DesktopAction): void {
     const refs: ElementRef[] =
-      action.kind === "pressKey"
+      action.kind === "pressKey" || action.kind === "typeText"
         ? []
         : action.kind === "drag"
           ? [action.from.element, action.to.element]
-          : action.kind === "appendText" || action.kind === "replaceText"
-            ? [action.target]
-            : "element" in action.target
-              ? [action.target.element]
-              : [];
+          : "element" in action.target
+            ? [action.target.element]
+            : [];
     for (const ref of refs) {
       const context = this.#context;
       if (
@@ -1221,6 +1292,53 @@ export class Mac2DesktopAdapter implements DesktopPort {
   #execute(script: string, payload: JsonObject, signal: AbortSignal): Promise<JsonObject> {
     return this.#sessionRequest("POST", "/execute/sync", { script, args: [payload] }, signal);
   }
+  #observationError(error: unknown, stage: string, signal?: AbortSignal): OperationError {
+    const detail = error instanceof Error ? error.message : "unknown";
+    const providerCategory = error instanceof WebDriverFailure ? error.category : undefined;
+    const code = signal?.aborted
+      ? "Cancelled"
+      : providerCategory === "invalidSession"
+        ? "SessionUnavailable"
+        : detail.includes("ambiguous window")
+          ? "AmbiguousWindowOwner"
+          : detail.includes("window not found") || detail.includes("not foreground")
+            ? "AppNotForeground"
+            : detail.includes("session")
+              ? "SessionUnavailable"
+              : detail.includes("unsafe xml")
+                ? "SnapshotIncomplete"
+                : "ProviderFailure";
+    return {
+      code,
+      phase: "observe",
+      message: `Mac2 observation failed at ${stage}${providerCategory ? ` with provider category ${providerCategory}` : ""}.`,
+      retryDisposition: "safe",
+    };
+  }
+  async #pageSource(signal: AbortSignal): Promise<JsonObject> {
+    try {
+      return await this.#sessionRequest("GET", "/source", undefined, signal);
+    } catch (firstError) {
+      signal.throwIfAborted();
+      try {
+        return await this.#execute("macos: source", { format: "xml" }, signal);
+      } catch {
+        signal.throwIfAborted();
+        throw firstError;
+      }
+    }
+  }
+  async #mainDisplayScreenshot(signal: AbortSignal): Promise<string> {
+    const response = await this.#execute("macos: screenshots", {}, signal);
+    const screenshots = asObject(response.value);
+    if (!screenshots || Object.keys(screenshots).length > 16) throw new Error("invalid display screenshots");
+    const main = Object.values(screenshots)
+      .map((item) => asObject(item))
+      .filter((item) => item?.isMain === true);
+    if (main.length !== 1 || typeof main[0]?.payload !== "string")
+      throw new Error("invalid main display screenshot");
+    return main[0].payload;
+  }
   #sessionRequest(method: string, path: string, body: unknown, signal: AbortSignal): Promise<JsonObject> {
     if (!this.#nativeSessionId) return Promise.reject(new Error("session"));
     return this.#request(method, `/session/${this.#nativeSessionId}${path}`, body, signal);
@@ -1257,9 +1375,18 @@ export class Mac2DesktopAdapter implements DesktopPort {
     }
     const value: unknown = JSON.parse(Buffer.concat(chunks).toString("utf8"));
     const object = asObject(value);
-    const providerError = asObject(object?.value)?.error;
+    const providerValue = asObject(object?.value);
+    const providerError = providerValue?.error;
+    const providerMessage = providerValue?.message;
     if (!response.ok || !object || typeof providerError === "string")
-      throw new WebDriverFailure(typeof providerError === "string" ? providerError : "transport");
+      throw new WebDriverFailure(
+        typeof providerError === "string"
+          ? providerErrorCategory(
+              providerError,
+              typeof providerMessage === "string" ? providerMessage : undefined,
+            )
+          : "transport",
+      );
     return object;
   }
 

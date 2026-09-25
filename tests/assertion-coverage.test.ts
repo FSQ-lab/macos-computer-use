@@ -11,6 +11,7 @@ const observation = (elements: unknown[], coverage = "complete") =>
     windowId: "window-00000001",
     observationId: "observation-00000001",
     capturedAt: "2026-09-22T00:00:00.000Z",
+    screenshotScope: "window",
     screenshot: { artifactId: "artifact-00000001", sha256: "a".repeat(64) },
     uiSnapshot: { artifactId: "artifact-00000002", sha256: "b".repeat(64) },
     coverage,

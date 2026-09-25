@@ -1,2 +1,11 @@
-export { createMacOSComputerUseClient, tryCreateMacOSComputerUseClient } from "./client.js";
-export type { MacOSComputerUseClient, ClientRun, ClientRunResult } from "./client.js";
+export {
+  createMacOSComputerUseClient,
+  createPiMacOSComputerUseClient,
+  tryCreateMacOSComputerUseClient,
+} from "./client.js";
+export type {
+  MacOSComputerUseClient,
+  PiMacOSComputerUseClient,
+  ClientRun,
+  ClientRunResult,
+} from "./client.js";

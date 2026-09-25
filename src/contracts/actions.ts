@@ -8,7 +8,7 @@ export const ElementPointSchema = z
   .object({ element: ElementRefSchema, point: RelativePointSchema.optional() })
   .strict();
 export const ModifierSchema = z.enum(["command", "control", "option", "shift", "function"]);
-export const SupportedKeySchema = z.enum([
+const specialKeys = [
   "enter",
   "tab",
   "escape",
@@ -23,7 +23,11 @@ export const SupportedKeySchema = z.enum([
   "end",
   "pageUp",
   "pageDown",
-]);
+] as const;
+const printableKey = z
+  .string()
+  .refine((value) => Array.from(value).length === 1 && !/[\p{Cc}\p{Cf}\r\n]/u.test(value));
+export const SupportedKeySchema = z.union([z.enum(specialKeys), printableKey]);
 export const SecretRefSchema = z
   .object({
     name: z.string().regex(/^[A-Z][A-Z0-9_]{1,127}$/),
@@ -68,9 +72,20 @@ const drag = z
     durationMs: z.number().int().min(50).max(30_000).optional(),
   })
   .strict();
-const text = z
-  .object({ kind: z.enum(["appendText", "replaceText"]), target: ElementRefSchema, value: TextInputSchema })
-  .strict();
+const typedText = z
+  .object({ kind: z.literal("typeText"), value: TextInputSchema })
+  .strict()
+  .superRefine((action, context) => {
+    if (
+      "literal" in action.value &&
+      (action.value.literal.length === 0 || /[\p{Cc}\p{Cf}\r\n]/u.test(action.value.literal))
+    )
+      context.addIssue({
+        code: "custom",
+        path: ["value", "literal"],
+        message: "Typed text must contain printable characters only.",
+      });
+  });
 const key = z
   .object({
     kind: z.literal("pressKey"),
@@ -82,7 +97,7 @@ const key = z
       .optional(),
   })
   .strict();
-export const DesktopActionSchema = z.union([pointer, scroll, swipe, drag, text, key]);
+export const DesktopActionSchema = z.union([pointer, scroll, swipe, drag, typedText, key]);
 
 export const AssertionSpecSchema = z.discriminatedUnion("kind", [
   z.object({ kind: z.literal("visible"), query: ElementQuerySchema }).strict(),
@@ -157,7 +172,20 @@ export const ActionTemplateSchema = z.discriminatedUnion("kind", [
       durationMs: z.number().int().min(50).max(30_000).optional(),
     })
     .strict(),
-  z.object({ kind: z.enum(["appendText", "replaceText"]), value: TextInputSchema }).strict(),
+  z
+    .object({ kind: z.literal("typeText"), value: TextInputSchema })
+    .strict()
+    .superRefine((action, context) => {
+      if (
+        "literal" in action.value &&
+        (action.value.literal.length === 0 || /[\p{Cc}\p{Cf}\r\n]/u.test(action.value.literal))
+      )
+        context.addIssue({
+          code: "custom",
+          path: ["value", "literal"],
+          message: "Typed text must contain printable characters only.",
+        });
+    }),
   z
     .object({
       kind: z.literal("pressKey"),
@@ -176,14 +204,25 @@ export const ScenarioStepSchema = z
     stepId: z.string().regex(/^[a-z][a-z0-9-]{0,63}$/),
     window: WindowQuerySchema.optional(),
     preconditions: z.array(AssertionSpecSchema).optional(),
-    target: ElementQuerySchema,
+    target: ElementQuerySchema.optional(),
     action: ActionTemplateSchema,
     verification: z.union([
       z.object({ policy: z.literal("immediate"), assertions: z.array(AssertionSpecSchema).min(1) }).strict(),
       z.object({ policy: z.literal("deferred") }).strict(),
     ]),
   })
-  .strict();
+  .strict()
+  .superRefine((step, context) => {
+    const targetless = step.action.kind === "pressKey" || step.action.kind === "typeText";
+    if (targetless && step.target !== undefined)
+      context.addIssue({
+        code: "custom",
+        path: ["target"],
+        message: "Keyboard actions do not accept a target.",
+      });
+    if (!targetless && step.target === undefined)
+      context.addIssue({ code: "custom", path: ["target"], message: "Element action requires a target." });
+  });
 
 export const ScenarioSchema = z
   .object({
@@ -210,4 +249,5 @@ export const ScenarioSchema = z
 export type RelativePoint = z.infer<typeof RelativePointSchema>;
 export type DesktopAction = z.infer<typeof DesktopActionSchema>;
 export type AssertionSpec = z.infer<typeof AssertionSpecSchema>;
+export type ActionTemplate = z.infer<typeof ActionTemplateSchema>;
 export type Scenario = z.infer<typeof ScenarioSchema>;

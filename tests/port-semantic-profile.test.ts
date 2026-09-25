@@ -164,6 +164,7 @@ class FakePorts implements ImagePort, VmPort, GuestPort, EvidencePort, DesktopPo
       }),
     );
   };
+  resolveApplication = () => this.#fail("resolveApplication", "guest");
   startAppium = () => {
     this.calls.push("startAppium");
     return Promise.resolve({
@@ -281,6 +282,7 @@ describe("shared semantic Port profile", () => {
       sessionId: "session-00000001" as SessionId,
       windowId: "window-00000001" as WindowId,
       capturedAt: "2026-01-01T00:00:00.000Z",
+      screenshotScope: "window",
       coverage: "complete",
       screenshot: { artifactId: "artifact-00000001" as ArtifactId, sha256: "a".repeat(64) },
       uiSnapshot: { artifactId: "artifact-00000002" as ArtifactId, sha256: "b".repeat(64) },
@@ -292,8 +294,8 @@ describe("shared semantic Port profile", () => {
       compatibility: {
         appiumMajor: 3 as const,
         appium: "3.7.0",
-        mac2: "4.3.1",
-        wdaSha256: "bad71dfeaaa51d3a7224f022c580cdb7424565ca0c4b7f72ad4b0c2b9a339b62",
+        mac2: "4.3.5",
+        wdaSha256: "094e95c782c034d5755a4056e55ae6e98284e9f2339f15b210a1309c4f46b733",
         guestMacOS: "26.0",
         xcode: "26.0",
         fixtureBuild: "1",
@@ -315,6 +317,7 @@ describe("shared semantic Port profile", () => {
       fake.destroy({ resourceId: runId, runId }, signal),
       fake.probe(runId, compatibility, signal),
       fake.configureNetwork(runId, [], signal),
+      fake.resolveApplication(runId, { name: "Fixture" }, signal),
       fake.startAppium(runId, signal),
       fake.stopAppium(runId, signal),
       fake.exportDiagnostics(runId, { maxFileBytes: 1, maxTotalBytes: 1 }, signal),
@@ -369,6 +372,7 @@ describe("shared semantic Port profile", () => {
       sessionId: "session-00000001" as SessionId,
       windowId: "window-00000001" as WindowId,
       capturedAt: "2026-01-01T00:00:00.000Z",
+      screenshotScope: "window",
       coverage: "complete",
       screenshot: { artifactId: "artifact-00000001" as ArtifactId, sha256: "a".repeat(64) },
       uiSnapshot: { artifactId: "artifact-00000002" as ArtifactId, sha256: "b".repeat(64) },
@@ -435,6 +439,7 @@ describe("shared semantic Port profile", () => {
     const guestMethods = [
       "probe",
       "configureNetwork",
+      "resolveApplication",
       "startAppium",
       "stopAppium",
       "exportDiagnostics",
@@ -472,7 +477,7 @@ describe("shared semantic Port profile", () => {
       guestMethods.length,
       evidenceMethods.length,
       desktopMethods.length,
-    ]).toEqual([1, 6, 5, 13, 10]);
+    ]).toEqual([1, 6, 6, 13, 10]);
 
     const cancelled = new AbortController();
     cancelled.abort(new Error("cancelled"));
@@ -523,8 +528,8 @@ describe("shared semantic Port profile", () => {
       compatibility: {
         appiumMajor: 3 as const,
         appium: "3.7.0",
-        mac2: "4.3.1",
-        wdaSha256: "bad71dfeaaa51d3a7224f022c580cdb7424565ca0c4b7f72ad4b0c2b9a339b62",
+        mac2: "4.3.5",
+        wdaSha256: "094e95c782c034d5755a4056e55ae6e98284e9f2339f15b210a1309c4f46b733",
         guestMacOS: "26.0",
         xcode: "26.0",
         fixtureBuild: "1",
@@ -540,6 +545,7 @@ describe("shared semantic Port profile", () => {
       tart.destroy({ resourceId: runId, runId }, cancelled.signal),
       guest.probe(runId, compatibility, cancelled.signal),
       guest.configureNetwork(runId, [], cancelled.signal),
+      guest.resolveApplication(runId, { name: "Fixture" }, cancelled.signal),
       guest.startAppium(runId, cancelled.signal),
       guest.stopAppium(runId, cancelled.signal),
       guest.exportDiagnostics(runId, { maxFileBytes: 1, maxTotalBytes: 1 }, cancelled.signal),
@@ -631,8 +637,8 @@ describe("shared semantic Port profile", () => {
               compatibility: {
                 appiumMajor: 3,
                 appium: "3.7.0",
-                mac2: "4.3.1",
-                wdaSha256: "bad71dfeaaa51d3a7224f022c580cdb7424565ca0c4b7f72ad4b0c2b9a339b62",
+                mac2: "4.3.5",
+                wdaSha256: "094e95c782c034d5755a4056e55ae6e98284e9f2339f15b210a1309c4f46b733",
                 guestMacOS: "26.0",
                 xcode: "26.0",
                 fixtureBuild: "1",
@@ -719,8 +725,8 @@ describe("shared semantic Port profile", () => {
         "26.0",
         "Xcode 26.0\nBuild version 17A",
         "3.7.0",
-        JSON.stringify({ mac2: { version: "4.3.1" } }),
-        "bad71dfeaaa51d3a7224f022c580cdb7424565ca0c4b7f72ad4b0c2b9a339b62",
+        JSON.stringify({ mac2: { version: "4.3.5" } }),
+        "094e95c782c034d5755a4056e55ae6e98284e9f2339f15b210a1309c4f46b733",
         "fixture-build-1",
         JSON.stringify({ bundleId: "com.example.Fixture", build: "1" }),
         "123",
@@ -733,8 +739,8 @@ describe("shared semantic Port profile", () => {
         compatibility: {
           appiumMajor: 3 as const,
           appium: "3.7.0",
-          mac2: "4.3.1",
-          wdaSha256: "bad71dfeaaa51d3a7224f022c580cdb7424565ca0c4b7f72ad4b0c2b9a339b62",
+          mac2: "4.3.5",
+          wdaSha256: "094e95c782c034d5755a4056e55ae6e98284e9f2339f15b210a1309c4f46b733",
           guestMacOS: "26.0",
           xcode: "26.0",
           fixtureBuild: "1",

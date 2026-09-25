@@ -1,6 +1,10 @@
 import { z } from "zod";
 import { createHash } from "node:crypto";
 import {
+  ApplicationDescriptorSchema,
+  ApplicationTargetSchema,
+  type ApplicationDescriptor,
+  type ApplicationTarget,
   err,
   ok,
   type GuestPort,
@@ -27,6 +31,39 @@ const receipt = (operationId: OperationId, startedAt: string): ProviderReceipt =
     startedAt,
     finishedAt: new Date().toISOString(),
   });
+
+const applicationRoots = [
+  "/Applications/",
+  "/System/Applications/",
+  "/System/Applications/Utilities/",
+  "/System/Cryptexes/App/System/Applications/",
+  "/Users/admin/Applications/",
+] as const;
+
+export const parseApplicationInventoryPaths = (input: string): readonly string[] => {
+  if (Buffer.byteLength(input, "utf8") > 1_000_000) throw new Error("Application inventory too large.");
+  const paths = input
+    .split(/\r?\n/u)
+    .filter(Boolean)
+    .filter((path) => path.length <= 1024 && path.toLocaleLowerCase().endsWith(".app"))
+    .filter((path) => applicationRoots.some((root) => path.startsWith(root)));
+  if (paths.length > 2_000) throw new Error("Application inventory has too many paths.");
+  return [...new Set(paths)];
+};
+
+export const parseApplicationMetadata = (
+  path: string,
+  bundleId: string,
+  version?: string,
+): ApplicationDescriptor => {
+  const fallbackName = path.slice(path.lastIndexOf("/") + 1, -4);
+  return ApplicationDescriptorSchema.parse({
+    name: fallbackName.normalize("NFC"),
+    bundleId: bundleId.trim(),
+    ...(version?.trim() ? { version: version.trim() } : {}),
+    location: path.startsWith("/Users/") ? "user" : "system",
+  });
+};
 
 export class TartExecGuestAdapter implements GuestPort {
   #elementOriginActions = false;
@@ -115,7 +152,7 @@ export class TartExecGuestAdapter implements GuestPort {
         .parse(fixture);
       const drivers: unknown = JSON.parse(outputs.get("drivers") ?? "");
       const driverMetadata = z
-        .object({ mac2: z.object({ version: z.literal("4.3.1") }).loose() })
+        .object({ mac2: z.object({ version: z.literal("4.3.5") }).loose() })
         .loose()
         .parse(drivers);
       actual = {
@@ -140,7 +177,7 @@ export class TartExecGuestAdapter implements GuestPort {
         actual.bundleId === expected.bundleId &&
         actual.fixtureBuild === expected.compatibility.fixtureBuild &&
         actual.windowServerReady;
-      this.#elementOriginActions = metadataValid && actual.mac2 === "4.3.1";
+      this.#elementOriginActions = metadataValid && actual.mac2 === "4.3.5";
     } catch {
       metadataValid = false;
       this.#elementOriginActions = false;
@@ -190,6 +227,97 @@ export class TartExecGuestAdapter implements GuestPort {
         retryDisposition: "notApplicable",
       });
     return ok(receipt(this.ids.next("operation") as OperationId, startedAt));
+  }
+  async resolveApplication(
+    cloneName: string,
+    target: ApplicationTarget,
+    signal: AbortSignal,
+  ): Promise<OperationResult<ApplicationDescriptor>> {
+    target = ApplicationTargetSchema.parse(target);
+    const inventory = await runProcess(
+      this.tart,
+      [
+        "exec",
+        this.#nativeName(cloneName),
+        "/bin/zsh",
+        "-lc",
+        "for root in /Applications /System/Applications /System/Cryptexes/App/System/Applications /Users/admin/Applications; do [ ! -d $root ] || /usr/bin/find $root -maxdepth 2 -type d -name '*.app'; done",
+      ],
+      signal,
+      1_000_000,
+    );
+    if (inventory.code !== 0)
+      return err({
+        code: signal.aborted ? "Cancelled" : "ProviderFailure",
+        phase: "guest",
+        message: "Installed application inventory is unavailable.",
+        retryDisposition: "safe",
+        ...(signal.aborted ? { dispatch: "notDispatched" as const } : {}),
+      });
+    try {
+      const expected = target.name.toLocaleLowerCase("en-US");
+      const paths = parseApplicationInventoryPaths(inventory.stdout).filter(
+        (path) =>
+          path
+            .slice(path.lastIndexOf("/") + 1, -4)
+            .normalize("NFC")
+            .toLocaleLowerCase("en-US") === expected,
+      );
+      if (paths.length !== 1)
+        return err({
+          code: paths.length === 0 ? "ApplicationNotFound" : "ApplicationAmbiguous",
+          phase: "guest",
+          message:
+            paths.length === 0
+              ? "No installed GUI application matches the requested display name."
+              : "Multiple installed GUI applications match the requested display name.",
+          retryDisposition: "notApplicable",
+        });
+      const path = paths[0] as string;
+      const bundleId = await runProcess(
+        this.tart,
+        [
+          "exec",
+          this.#nativeName(cloneName),
+          "/usr/bin/plutil",
+          "-extract",
+          "CFBundleIdentifier",
+          "raw",
+          "-o",
+          "-",
+          `${path}/Contents/Info.plist`,
+        ],
+        signal,
+        4096,
+      );
+      if (bundleId.code !== 0) throw new Error("metadata");
+      const version = await runProcess(
+        this.tart,
+        [
+          "exec",
+          this.#nativeName(cloneName),
+          "/usr/bin/plutil",
+          "-extract",
+          "CFBundleShortVersionString",
+          "raw",
+          "-o",
+          "-",
+          `${path}/Contents/Info.plist`,
+        ],
+        signal,
+        4096,
+      );
+      return ok(
+        parseApplicationMetadata(path, bundleId.stdout, version.code === 0 ? version.stdout : undefined),
+      );
+    } catch {
+      return err({
+        code: "ProviderFailure",
+        phase: "guest",
+        message: "Installed application inventory is invalid.",
+        retryDisposition: "notApplicable",
+      });
+    }
   }
   async startAppium(
     cloneName: string,

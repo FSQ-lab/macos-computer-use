@@ -10,6 +10,7 @@ import {
   ok,
   type ArtifactDescriptor,
   type ArtifactRef,
+  type ApplicationTarget,
   type AssertionSpec,
   type DesktopAction,
   type DesktopPort,
@@ -46,6 +47,19 @@ import type { Clock, Hasher, IdGenerator, KernelHook, SecretResolver } from "./r
 import { StageTimeoutError, retrySafe, withStageSignal } from "./timeout.js";
 import { deliverHooks } from "./hook-pipeline.js";
 
+const PROTECTED_APPLICATION_BUNDLE_IDS = new Set([
+  "com.apple.Passwords",
+  "com.apple.keychainaccess",
+  "com.apple.systempreferences",
+  "com.apple.installer",
+  "com.apple.Terminal",
+  "com.apple.ScriptEditor2",
+  "com.apple.Automator",
+  "com.apple.shortcuts",
+  "com.apple.SecurityAgent",
+  "com.apple.loginwindow",
+]);
+
 export interface GatewayLock {
   acquire(): Promise<OperationResult<() => Promise<void>>>;
 }
@@ -67,6 +81,7 @@ export type InteractiveRun = {
   readonly leaseId: LeaseId;
   observe(): Promise<OperationResult<Observation>>;
   assert(assertion: AssertionSpec): Promise<OperationResult<AssertionResult>>;
+  assertCurrent(assertion: AssertionSpec): Promise<OperationResult<AssertionResult>>;
   query(query: ElementQuery): OperationResult<ElementRef>;
   queryPage(query: ElementQuery, options?: { offset?: number; limit?: number }): OperationResult<QueryPage>;
   compact(): OperationResult<string>;
@@ -438,6 +453,7 @@ export class Gateway {
           this.deps.ids,
           config.timeouts,
           this.deps.hooks,
+          config.retry.observation,
         );
         let stopped = false;
         let executedSteps = 0;
@@ -471,15 +487,15 @@ export class Gateway {
             const latestTimeline = await this.deps.evidence.readTimeline(runId, signal);
             if (latestTimeline.ok) sequence = latestTimeline.value.length;
           }
-          const target = this.#unique(observation, step.target);
-          if (!target.ok) {
+          const target = step.target ? this.#unique(observation, step.target) : undefined;
+          if (target && !target.ok) {
             await append("StepProjected", { stepId: step.stepId, status: "failed" });
             executedSteps += 1;
             verdict = "inconclusive";
             stopped = true;
             break;
           }
-          const action = this.#materialize(step.action, target.value, observation, config);
+          const action = this.#materialize(step.action, target?.value, observation, config);
           if (!action.ok) {
             await append("StepProjected", { stepId: step.stepId, status: "failed" });
             executedSteps += 1;
@@ -594,16 +610,7 @@ export class Gateway {
       } finally {
         environment.beginCleanup();
         evidenceDeadline = this.deps.clock.monotonicMs() + config.timeouts.evidenceFinalizeMs;
-        const cleanupStarted = this.deps.clock.monotonicMs();
-        const cleanupRemaining = (): number =>
-          Math.max(0, config.timeouts.cleanupMs - (this.deps.clock.monotonicMs() - cleanupStarted));
         await append("CleanupStarted", {});
-        if (sessionStarted) {
-          const closed = await this.#cleanupAttempt(cleanupRemaining(), (cleanupSignal) =>
-            this.deps.desktop.stopSession(cleanupSignal),
-          );
-          if (!closed) cleanupCompleted = false;
-        }
         if (cloneName && appiumStarted) {
           const diagnostics = await this.#cleanupValue(evidenceRemaining(), (cleanupSignal) =>
             this.deps.guest.exportDiagnostics(
@@ -637,6 +644,17 @@ export class Gateway {
               });
             } else evidenceState.complete = false;
           } else evidenceState.complete = false;
+        }
+        const cleanupStarted = this.deps.clock.monotonicMs();
+        const cleanupRemaining = (): number =>
+          Math.max(0, config.timeouts.cleanupMs - (this.deps.clock.monotonicMs() - cleanupStarted));
+        if (sessionStarted) {
+          const closed = await this.#cleanupAttempt(cleanupRemaining(), (cleanupSignal) =>
+            this.deps.desktop.stopSession(cleanupSignal),
+          );
+          if (!closed) cleanupCompleted = false;
+        }
+        if (cloneName && appiumStarted) {
           const appiumStopped = await this.#cleanupAttempt(cleanupRemaining(), (cleanupSignal) =>
             this.deps.guest.stopAppium(cloneName as string, cleanupSignal),
           );
@@ -645,13 +663,13 @@ export class Gateway {
         if (cloneName) {
           const cleanupRecorded =
             (
-              await this.#cleanupValue(evidenceRemaining(), (evidenceSignal) =>
+              await this.#cleanupValue(cleanupRemaining(), (cleanupSignal) =>
                 this.#resource(
                   runId,
                   cloneName as string,
                   config.image.digest,
                   "cleanupStarted",
-                  evidenceSignal,
+                  cleanupSignal,
                 ),
               )
             )?.ok === true;
@@ -667,17 +685,23 @@ export class Gateway {
           if (destroyed?.ok) {
             const completionRecorded =
               (
-                await this.#cleanupValue(evidenceRemaining(), (evidenceSignal) =>
+                await this.#cleanupValue(cleanupRemaining(), (cleanupSignal) =>
                   this.#resource(
                     runId,
                     cloneName as string,
                     config.image.digest,
                     "cleanupCompleted",
-                    evidenceSignal,
+                    cleanupSignal,
                   ),
                 )
               )?.ok === true;
             cleanupCompleted = cleanupCompleted && completionRecorded;
+            if (completionRecorded) {
+              const cleared = await this.#cleanupValue(cleanupRemaining(), (cleanupSignal) =>
+                this.deps.evidence.clearManagedResource(cleanupSignal),
+              );
+              cleanupCompleted = cleanupCompleted && cleared?.ok === true;
+            }
           }
         }
         await append("CleanupFinished", { status: cleanupCompleted ? "completed" : "failed" });
@@ -728,12 +752,6 @@ export class Gateway {
           ),
         );
         if (!manifest?.ok) evidenceState.complete = false;
-        if (manifest?.ok && cleanupCompleted && cloneName) {
-          const cleared = await this.#cleanupValue(evidenceRemaining(), (evidenceSignal) =>
-            this.deps.evidence.clearManagedResource(evidenceSignal),
-          );
-          if (!cleared?.ok) cleanupCompleted = false;
-        }
         environment.close(cleanupCompleted);
       }
       return ok({
@@ -755,9 +773,11 @@ export class Gateway {
     callback: (run: InteractiveRun) => Promise<T>,
     signal: AbortSignal,
     appEnvironment?: Readonly<Record<string, string>>,
+    application?: ApplicationTarget,
   ): Promise<OperationResult<{ runId: RunId; result: RunResult; value?: T }>> {
     config = structuredClone(config);
     finalAssertions = structuredClone(finalAssertions);
+    application = application ? structuredClone(application) : undefined;
     const acquired = await this.deps.lock.acquire();
     if (!acquired.ok) return acquired;
     try {
@@ -1019,6 +1039,25 @@ export class Gateway {
             this.deps.guest.configureNetwork(cloneName as string, config.network, stageSignal),
           ),
         );
+        let effectiveBundleId = config.aut.bundleId;
+        let effectiveWindow = config.aut.window;
+        if (application) {
+          const resolved = this.#unwrap(
+            await this.#stage(config.timeouts, "guestReadyMs", startedMono, signal, (stageSignal) =>
+              this.deps.guest.resolveApplication(cloneName as string, application, stageSignal),
+            ),
+          );
+          if (PROTECTED_APPLICATION_BUNDLE_IDS.has(resolved.bundleId))
+            throw new RunFailure({
+              code: "ProtectedApplication",
+              phase: "guest",
+              message: "The selected application is protected.",
+              retryDisposition: "notApplicable",
+              dispatch: "notDispatched",
+            });
+          effectiveBundleId = resolved.bundleId;
+          effectiveWindow = { role: "window" };
+        }
         const appium = this.#unwrap(
           await this.#stage(config.timeouts, "appiumStartMs", startedMono, signal, (stageSignal) =>
             this.#retryResult(config.retry.readiness, stageSignal, (attemptSignal) =>
@@ -1032,10 +1071,10 @@ export class Gateway {
             this.deps.desktop.startSession(
               {
                 channelId: appium.channelId,
-                bundleId: config.aut.bundleId,
-                window: config.aut.window,
-                ...(config.aut.arguments ? { arguments: config.aut.arguments } : {}),
-                ...(appEnvironment ? { environment: appEnvironment } : {}),
+                bundleId: effectiveBundleId,
+                window: effectiveWindow,
+                ...(!application && config.aut.arguments ? { arguments: config.aut.arguments } : {}),
+                ...(!application && appEnvironment ? { environment: appEnvironment } : {}),
               },
               stageSignal,
             ),
@@ -1086,7 +1125,7 @@ export class Gateway {
               artifacts,
               stageSignal,
               startedMono,
-              config.aut.window,
+              effectiveWindow,
             ),
           ),
         );
@@ -1124,6 +1163,20 @@ export class Gateway {
                 message: "Another operation is active.",
                 retryDisposition: "safe",
               });
+            try {
+              environment.requireLease(leaseId, this.deps.clock.monotonicMs());
+              if (!application) environment.requireReady(this.deps.clock.monotonicMs());
+            } catch {
+              return err({
+                code:
+                  this.deps.clock.monotonicMs() > environment.lease.expiresAtMs
+                    ? "LeaseExpired"
+                    : "ReadinessExpired",
+                phase: "observe",
+                message: "Run readiness or lease expired.",
+                retryDisposition: "safe",
+              });
+            }
             if (!observation || !this.deps.desktop.queryPage)
               return err({
                 code: "SnapshotIncomplete",
@@ -1155,10 +1208,13 @@ export class Gateway {
               });
             try {
               environment.requireLease(leaseId, this.deps.clock.monotonicMs());
-              environment.requireReady(this.deps.clock.monotonicMs());
+              if (!application) environment.requireReady(this.deps.clock.monotonicMs());
             } catch {
               return err({
-                code: "ReadinessExpired",
+                code:
+                  this.deps.clock.monotonicMs() > environment.lease.expiresAtMs
+                    ? "LeaseExpired"
+                    : "ReadinessExpired",
                 phase: "observe",
                 message: "Run readiness or lease expired.",
                 retryDisposition: "safe",
@@ -1218,6 +1274,85 @@ export class Gateway {
               settleOperation?.();
             }
           },
+          assertCurrent: async (assertion) => {
+            if (closed)
+              return err({
+                code: "RunClosed",
+                phase: "observe",
+                message: "Run scope is closed.",
+                retryDisposition: "notApplicable",
+              });
+            if (operationActive)
+              return err({
+                code: "GatewayBusy",
+                phase: "observe",
+                message: "Another Run operation is active.",
+                retryDisposition: "safe",
+              });
+            try {
+              environment.requireLease(leaseId, this.deps.clock.monotonicMs());
+              if (!application) environment.requireReady(this.deps.clock.monotonicMs());
+            } catch {
+              return err({
+                code:
+                  this.deps.clock.monotonicMs() > environment.lease.expiresAtMs
+                    ? "LeaseExpired"
+                    : "ReadinessExpired",
+                phase: "observe",
+                message: "Run readiness or lease expired.",
+                retryDisposition: "safe",
+              });
+            }
+            if (!observation)
+              return err({
+                code: "SnapshotIncomplete",
+                phase: "observe",
+                message: "No current Observation is available.",
+                retryDisposition: "safe",
+              });
+            const frozen = structuredClone(assertion);
+            operationActive = true;
+            operationSettled = new Promise<void>((resolve) => {
+              settleOperation = resolve;
+            });
+            try {
+              const evaluated = await this.#stage(
+                config.timeouts,
+                "assertionMs",
+                startedMono,
+                operationSignal,
+                (stageSignal) => this.deps.desktop.evaluate(frozen, observation as Observation, stageSignal),
+              );
+              const status = evaluated.ok ? evaluated.value.status : "unverifiable";
+              const reason = evaluated.ok ? evaluated.value.reason : evaluated.error.code;
+              const recorded = await append("AssertionEvaluated", {
+                kind: frozen.kind,
+                status,
+                reason,
+                observationId: observation.observationId,
+              });
+              if (!recorded)
+                return err({
+                  code: "EvidenceIncomplete",
+                  phase: "evidence",
+                  message: "Assertion Evidence could not be committed.",
+                  retryDisposition: "notApplicable",
+                });
+              return ok(
+                AssertionResultSchema.parse({
+                  assertionId: this.deps.ids.next("assertion"),
+                  status,
+                  reason,
+                  observationId: observation.observationId,
+                  observationRef:
+                    frozen.kind === "aiVisual" ? observation.screenshot : observation.uiSnapshot,
+                }),
+              );
+            } finally {
+              operationActive = false;
+              settleOperation?.();
+            }
+          },
           observe: async () => {
             if (closed)
               return err({
@@ -1228,7 +1363,7 @@ export class Gateway {
               });
             try {
               environment.requireLease(leaseId, this.deps.clock.monotonicMs());
-              environment.requireReady(this.deps.clock.monotonicMs());
+              if (!application) environment.requireReady(this.deps.clock.monotonicMs());
             } catch {
               return err({
                 code:
@@ -1298,7 +1433,7 @@ export class Gateway {
                       message: "Run lease expired.",
                       retryDisposition: "safe",
                     })
-                  : !this.#isReady(environment)
+                  : !application && !this.#isReady(environment)
                     ? err({
                         code: "ReadinessExpired",
                         phase: "observe",
@@ -1335,7 +1470,7 @@ export class Gateway {
                       message: "Run lease expired.",
                       retryDisposition: "safe",
                     })
-                  : !this.#isReady(environment)
+                  : !application && !this.#isReady(environment)
                     ? err({
                         code: "ReadinessExpired",
                         phase: "observe",
@@ -1372,7 +1507,7 @@ export class Gateway {
                       message: "Run lease expired.",
                       retryDisposition: "safe",
                     })
-                  : !this.#isReady(environment)
+                  : !application && !this.#isReady(environment)
                     ? err({
                         code: "ReadinessExpired",
                         phase: "observe",
@@ -1404,7 +1539,7 @@ export class Gateway {
               });
             try {
               environment.requireLease(leaseId, this.deps.clock.monotonicMs());
-              environment.requireReady(this.deps.clock.monotonicMs());
+              if (!application) environment.requireReady(this.deps.clock.monotonicMs());
             } catch {
               return err({
                 code:
@@ -1436,11 +1571,12 @@ export class Gateway {
               this.deps.ids,
               config.timeouts,
               this.deps.hooks,
+              config.retry.observation,
             );
-            if ((action.kind === "appendText" || action.kind === "replaceText") && "secret" in action.value) {
+            if (action.kind === "typeText" && "secret" in action.value) {
               const materialized = this.#materialize(
                 { kind: action.kind, value: action.value },
-                action.target,
+                undefined,
                 observation,
                 config,
               );
@@ -1461,12 +1597,14 @@ export class Gateway {
                   windowId: observation.windowId,
                   expectedObservationId: observation.observationId,
                   deadlineMs: startedMono + config.timeouts.runTotalMs,
-                  readyUntilMs: Math.min(
-                    environment.lease.expiresAtMs,
-                    ...[...environment.readiness.values()].map(
-                      (probe) => probe.observedAtMs + probe.validForMs,
-                    ),
-                  ),
+                  readyUntilMs: application
+                    ? environment.lease.expiresAtMs
+                    : Math.min(
+                        environment.lease.expiresAtMs,
+                        ...[...environment.readiness.values()].map(
+                          (probe) => probe.observedAtMs + probe.validForMs,
+                        ),
+                      ),
                   sequence,
                   startedMono,
                 },
@@ -1560,16 +1698,7 @@ export class Gateway {
         closed = true;
         environment.beginCleanup();
         evidenceDeadline = this.deps.clock.monotonicMs() + config.timeouts.evidenceFinalizeMs;
-        const cleanupStarted = this.deps.clock.monotonicMs();
-        const cleanupRemaining = (): number =>
-          Math.max(0, config.timeouts.cleanupMs - (this.deps.clock.monotonicMs() - cleanupStarted));
         await append("CleanupStarted", {});
-        if (sessionStarted) {
-          const closed = await this.#cleanupAttempt(cleanupRemaining(), (cleanupSignal) =>
-            this.deps.desktop.stopSession(cleanupSignal),
-          );
-          if (!closed) cleanupCompleted = false;
-        }
         if (cloneName && appiumStarted) {
           const diagnostics = await this.#cleanupValue(evidenceRemaining(), (cleanupSignal) =>
             this.deps.guest.exportDiagnostics(
@@ -1603,6 +1732,17 @@ export class Gateway {
               });
             } else evidenceState.complete = false;
           } else evidenceState.complete = false;
+        }
+        const cleanupStarted = this.deps.clock.monotonicMs();
+        const cleanupRemaining = (): number =>
+          Math.max(0, config.timeouts.cleanupMs - (this.deps.clock.monotonicMs() - cleanupStarted));
+        if (sessionStarted) {
+          const closed = await this.#cleanupAttempt(cleanupRemaining(), (cleanupSignal) =>
+            this.deps.desktop.stopSession(cleanupSignal),
+          );
+          if (!closed) cleanupCompleted = false;
+        }
+        if (cloneName && appiumStarted) {
           const appiumStopped = await this.#cleanupAttempt(cleanupRemaining(), (cleanupSignal) =>
             this.deps.guest.stopAppium(cloneName as string, cleanupSignal),
           );
@@ -1611,13 +1751,13 @@ export class Gateway {
         if (cloneName) {
           const cleanupRecorded =
             (
-              await this.#cleanupValue(evidenceRemaining(), (evidenceSignal) =>
+              await this.#cleanupValue(cleanupRemaining(), (cleanupSignal) =>
                 this.#resource(
                   runId,
                   cloneName as string,
                   config.image.digest,
                   "cleanupStarted",
-                  evidenceSignal,
+                  cleanupSignal,
                 ),
               )
             )?.ok === true;
@@ -1633,17 +1773,23 @@ export class Gateway {
           if (destroyed?.ok) {
             const completionRecorded =
               (
-                await this.#cleanupValue(evidenceRemaining(), (evidenceSignal) =>
+                await this.#cleanupValue(cleanupRemaining(), (cleanupSignal) =>
                   this.#resource(
                     runId,
                     cloneName as string,
                     config.image.digest,
                     "cleanupCompleted",
-                    evidenceSignal,
+                    cleanupSignal,
                   ),
                 )
               )?.ok === true;
             cleanupCompleted = cleanupCompleted && completionRecorded;
+            if (completionRecorded) {
+              const cleared = await this.#cleanupValue(cleanupRemaining(), (cleanupSignal) =>
+                this.deps.evidence.clearManagedResource(cleanupSignal),
+              );
+              cleanupCompleted = cleanupCompleted && cleared?.ok === true;
+            }
           }
         }
         await append("CleanupFinished", { status: cleanupCompleted ? "completed" : "failed" });
@@ -1694,12 +1840,6 @@ export class Gateway {
           ),
         );
         if (!manifest?.ok) evidenceState.complete = false;
-        if (manifest?.ok && cleanupCompleted && cloneName) {
-          const cleared = await this.#cleanupValue(evidenceRemaining(), (evidenceSignal) =>
-            this.deps.evidence.clearManagedResource(evidenceSignal),
-          );
-          if (!cleared?.ok) cleanupCompleted = false;
-        }
         environment.close(cleanupCompleted);
       }
       return ok({
@@ -2226,16 +2366,29 @@ export class Gateway {
       signal,
     );
     if (!observed.ok) return observed;
+    if (!observed.value.screenshot)
+      return observed.value.screenshotError
+        ? err(observed.value.screenshotError)
+        : err({
+            code: "EvidenceIncomplete",
+            phase: "observe",
+            message: "Required Observation screenshot is unavailable.",
+            retryDisposition: "notApplicable",
+          });
+    const observedScreenshot = observed.value.screenshot;
     const persisted = async <T>(operation: (stageSignal: AbortSignal) => Promise<T>): Promise<T> =>
       withStageSignal(30_000, signal, operation, this.deps.clock, true);
     const screenshot = await persisted((evidenceSignal) =>
       this.deps.evidence.commitArtifact(
         {
           runId,
-          type: "window-screenshot",
+          type:
+            observed.value.observation.screenshotScope === "display"
+              ? "display-screenshot"
+              : "window-screenshot",
           mimeType: "image/png",
           sensitivity: "potentiallySensitive",
-          bytes: observed.value.screenshot,
+          bytes: observedScreenshot,
         },
         evidenceSignal,
       ),
@@ -2288,7 +2441,7 @@ export class Gateway {
           elapsedMs: Math.max(0, this.deps.clock.monotonicMs() - startedMono),
           type: "ObservationCaptured",
           source: "kernel",
-          data: { observationId },
+          data: { observationId, screenshotScope: observed.value.observation.screenshotScope },
         },
         evidenceSignal,
       ),
@@ -2302,7 +2455,7 @@ export class Gateway {
       elapsedMs: Math.max(0, this.deps.clock.monotonicMs() - startedMono),
       type: "ObservationCaptured",
       source: "kernel",
-      data: { observationId },
+      data: { observationId, screenshotScope: observed.value.observation.screenshotScope },
     });
     const hookResult = await deliverHooks({
       event: capturedEvent,
@@ -2327,11 +2480,19 @@ export class Gateway {
   }
   #materialize(
     template: Scenario["actions"][number]["action"],
-    target: ElementRef,
+    target: ElementRef | undefined,
     observation: Observation,
     config: GatewayConfig,
   ): OperationResult<DesktopAction> {
     if (template.kind === "drag") {
+      if (!target)
+        return err({
+          code: "TargetNotFound",
+          phase: "action",
+          message: "Drag requires a unique source target.",
+          retryDisposition: "safe",
+          dispatch: "notDispatched",
+        });
       const destination = this.#unique(observation, template.destination);
       if (!destination.ok) return destination;
       return ok({
@@ -2344,8 +2505,8 @@ export class Gateway {
         ...(template.durationMs ? { durationMs: template.durationMs } : {}),
       });
     }
-    if (template.kind === "appendText" || template.kind === "replaceText") {
-      if ("literal" in template.value) return ok({ kind: template.kind, target, value: template.value });
+    if (template.kind === "typeText") {
+      if ("literal" in template.value) return ok({ kind: "typeText", value: template.value });
       const name = template.value.secret.name;
       if (template.value.secret.purpose !== "textInput" || !config.secrets.allowedNames.includes(name))
         return err({
@@ -2364,13 +2525,21 @@ export class Gateway {
           retryDisposition: "safe",
           dispatch: "notDispatched",
         });
-      return ok({ kind: template.kind, target, value: { literal: value } });
+      return ok({ kind: "typeText", value: { literal: value } });
     }
     if (template.kind === "pressKey")
       return ok({
         kind: "pressKey",
         key: template.key,
         ...(template.modifiers ? { modifiers: template.modifiers } : {}),
+      });
+    if (!target)
+      return err({
+        code: "TargetNotFound",
+        phase: "action",
+        message: "Element-targeted action requires a unique target.",
+        retryDisposition: "safe",
+        dispatch: "notDispatched",
       });
     if (template.kind === "scroll")
       return ok({

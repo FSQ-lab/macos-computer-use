@@ -63,6 +63,7 @@ const EventDataSchemas = {
   ObservationCaptured: z
     .object({
       observationId: z.string(),
+      screenshotScope: z.enum(["window", "display", "unavailable"]).optional(),
       coverage: z.string().optional(),
       screenshot: ArtifactRefSchema.optional(),
       uiSnapshot: ArtifactRefSchema.optional(),

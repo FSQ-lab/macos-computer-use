@@ -21,6 +21,11 @@ import {
 import { runProcess } from "./process-runner.js";
 
 const now = (): string => new Date().toISOString();
+export const tartRunArguments = (nativeName: string): readonly string[] => [
+  "run",
+  "--no-clipboard",
+  nativeName,
+];
 export class TartAdapter implements ImagePort, VmPort {
   #runningProcess: ChildProcess | undefined;
   constructor(
@@ -155,14 +160,9 @@ export class TartAdapter implements ImagePort, VmPort {
       );
     const startedAt = now();
     return new Promise((resolve) => {
-      const networkArgs = ["--net-host"];
-      const child = spawn(
-        this.executable,
-        ["run", ...networkArgs, "--no-clipboard", this.#nativeName(request.resourceId)],
-        {
-          stdio: ["ignore", "ignore", "pipe"],
-        },
-      );
+      const child = spawn(this.executable, tartRunArguments(this.#nativeName(request.resourceId)), {
+        stdio: ["ignore", "ignore", "pipe"],
+      });
       this.#runningProcess = child;
       child.stderr.resume();
       let settled = false;

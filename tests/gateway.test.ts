@@ -71,7 +71,7 @@ const config = (root: string) => ({
   },
   aut: { bundleId: "com.example.App", window: { isMain: true } },
   timeouts: {
-    runTotalMs: 100_000,
+    runTotalMs: 7_200_000 as const,
     imagePullMs: 1000,
     cloneMs: 1000,
     vmBootMs: 1000,
@@ -83,7 +83,7 @@ const config = (root: string) => ({
     actionMs: 1000,
     assertionMs: 1000,
     evidenceFinalizeMs: 1000,
-    cleanupMs: 1000,
+    cleanupMs: 120_000 as const,
   },
   state: { root: join(root, "state"), tempRoot: join(root, "temp") },
   evidence: {
@@ -103,8 +103,8 @@ const config = (root: string) => ({
     tart: "2.35" as const,
     appiumMajor: 3 as const,
     appium: "3.7.0" as const,
-    mac2: "4.3.1" as const,
-    wdaSha256: "bad71dfeaaa51d3a7224f022c580cdb7424565ca0c4b7f72ad4b0c2b9a339b62" as const,
+    mac2: "4.3.5" as const,
+    wdaSha256: "094e95c782c034d5755a4056e55ae6e98284e9f2339f15b210a1309c4f46b733" as const,
     guestMacOS: "26.0",
     xcode: "26.0",
     fixtureBuild: "1",
@@ -161,7 +161,7 @@ describe("gateway", () => {
     const platform = new FakePlatform();
     const clock = new TestClock();
     const stopSession = vi.spyOn(platform, "stopSession").mockImplementation(async () => {
-      clock.value += 2_000;
+      clock.value += 121_000;
       return ok(receipt());
     });
     const stopAppium = vi.spyOn(platform, "stopAppium");
@@ -192,6 +192,47 @@ describe("gateway", () => {
     expect(result.ok && result.value.result.cleanup).toBe("failed");
     expect(stopSession).toHaveBeenCalledOnce();
     expect(stopAppium).not.toHaveBeenCalled();
+  });
+  it("reserves the full cleanup budget after slow diagnostic Evidence work", async () => {
+    const root = await mkdtemp(join(tmpdir(), "mcu-cleanup-reserve-"));
+    roots.push(root);
+    const platform = new FakePlatform();
+    const clock = new TestClock();
+    vi.spyOn(platform, "exportDiagnostics").mockImplementation(async () => {
+      clock.value += 119_000;
+      return ok(new TextEncoder().encode("diagnostics"));
+    });
+    const stopSession = vi.spyOn(platform, "stopSession");
+    const stopAppium = vi.spyOn(platform, "stopAppium");
+    const stopVm = vi.spyOn(platform, "stop");
+    const destroy = vi.spyOn(platform, "destroy");
+    const gateway = new Gateway({
+      image: platform,
+      vm: platform,
+      guest: platform,
+      desktop: platform,
+      evidence: new LocalEvidenceAdapter(join(root, "evidence"), join(root, "state"), 10_000),
+      clock,
+      ids: new TestIds(),
+      ...support,
+      lock: { acquire: async () => ok(async () => undefined) },
+      buildVersion: "test",
+    });
+    const result = await gateway.execute(
+      config(root),
+      {
+        schemaVersion: 1,
+        name: "cleanup-reserve",
+        actions: [],
+        finalAssertions: [{ kind: "visible", query: { role: "button" } }],
+      },
+      new AbortController().signal,
+    );
+    expect(result.ok && result.value.result.cleanup).toBe("completed");
+    expect(stopSession).toHaveBeenCalledOnce();
+    expect(stopAppium).toHaveBeenCalledOnce();
+    expect(stopVm).toHaveBeenCalledOnce();
+    expect(destroy).toHaveBeenCalledOnce();
   });
   it("passes only the ImagePort request contract at the adapter boundary", async () => {
     const root = await mkdtemp(join(tmpdir(), "mcu-image-request-"));
@@ -507,6 +548,17 @@ describe("gateway", () => {
     const platform = new FakePlatform();
     platform.assertionStatus = "failed";
     const evidence = new LocalEvidenceAdapter(join(root, "evidence"), join(root, "state"), 10_000);
+    const started = await evidence.append({
+      schemaVersion: 1,
+      runId: "run-00000001" as RunId,
+      sequence: 1,
+      recordedAt: "2026-09-21T00:00:00.000Z",
+      elapsedMs: 0,
+      type: "RunStarted",
+      source: "kernel",
+      data: { mode: "interactive" },
+    });
+    if (!started.ok) throw new Error(started.error.message);
     const transaction = new ActionTransaction(
       platform,
       evidence,
@@ -581,6 +633,144 @@ describe("gateway", () => {
     expect(shown.ok && shown.value.artifacts.some((artifact) => artifact.type === "hook-manifest-note")).toBe(
       true,
     );
+  });
+  it("resolves and freezes a Pi-selected application before session creation", async () => {
+    const root = await mkdtemp(join(tmpdir(), "mcu-selected-app-"));
+    roots.push(root);
+    const platform = new FakePlatform();
+    vi.spyOn(platform, "resolveApplication").mockResolvedValue(
+      ok({ name: "Safari", bundleId: "com.apple.Safari", version: "26.0", location: "system" }),
+    );
+    const gateway = new Gateway({
+      image: platform,
+      vm: platform,
+      guest: platform,
+      desktop: platform,
+      evidence: new LocalEvidenceAdapter(join(root, "evidence"), join(root, "state"), 10_000),
+      clock: new TestClock(),
+      ids: new TestIds(),
+      ...support,
+      lock: { acquire: async () => ok(async () => undefined) },
+      buildVersion: "test",
+    });
+    const result = await gateway.executeInteractive(
+      config(root),
+      [{ kind: "visible", query: { role: "button" } }],
+      async () => undefined,
+      new AbortController().signal,
+      undefined,
+      { name: "Safari" },
+    );
+    expect(result.ok).toBe(true);
+    expect(platform.sessionRequest).toMatchObject({
+      bundleId: "com.apple.Safari",
+      window: { role: "window" },
+    });
+  });
+
+  it("keeps a Pi-selected interactive Run usable after initial readiness freshness expires", async () => {
+    const root = await mkdtemp(join(tmpdir(), "mcu-selected-app-readiness-"));
+    roots.push(root);
+    const platform = new FakePlatform();
+    const clock = new TestClock();
+    const dispatch = vi.spyOn(platform, "dispatch");
+    const gateway = new Gateway({
+      image: platform,
+      vm: platform,
+      guest: platform,
+      desktop: platform,
+      evidence: new LocalEvidenceAdapter(join(root, "evidence"), join(root, "state"), 10_000),
+      clock,
+      ids: new TestIds(),
+      ...support,
+      lock: { acquire: async () => ok(async () => undefined) },
+      buildVersion: "test",
+    });
+    const result = await gateway.executeInteractive(
+      config(root),
+      [{ kind: "visible", query: { role: "button" } }],
+      async (run) => {
+        clock.value += 2_000;
+        const observed = await run.observe();
+        expect(observed.ok).toBe(true);
+        const target = run.query({ role: "button" });
+        if (!target.ok) throw new Error(target.error.code);
+        const action = await run.action({ kind: "click", target: { element: target.value } });
+        expect(action.ok && action.value.result.dispatch).toBe("dispatched");
+      },
+      new AbortController().signal,
+      undefined,
+      { name: "Fixture" },
+    );
+    expect(result.ok).toBe(true);
+    expect(dispatch).toHaveBeenCalledOnce();
+  });
+
+  it("keeps configured interactive queryPage behind readiness freshness", async () => {
+    const root = await mkdtemp(join(tmpdir(), "mcu-configured-query-page-readiness-"));
+    roots.push(root);
+    const platform = new FakePlatform();
+    const clock = new TestClock();
+    const gateway = new Gateway({
+      image: platform,
+      vm: platform,
+      guest: platform,
+      desktop: platform,
+      evidence: new LocalEvidenceAdapter(join(root, "evidence"), join(root, "state"), 10_000),
+      clock,
+      ids: new TestIds(),
+      ...support,
+      lock: { acquire: async () => ok(async () => undefined) },
+      buildVersion: "test",
+    });
+    const result = await gateway.executeInteractive(
+      config(root),
+      [{ kind: "visible", query: { role: "button" } }],
+      async (run) => {
+        clock.value += 2_000;
+        const page = run.queryPage({ role: "button" });
+        expect(!page.ok && page.error.code).toBe("ReadinessExpired");
+      },
+      new AbortController().signal,
+    );
+    expect(result.ok).toBe(true);
+  });
+
+  it("rejects a protected Pi-selected application before starting a session", async () => {
+    const root = await mkdtemp(join(tmpdir(), "mcu-protected-app-"));
+    roots.push(root);
+    const platform = new FakePlatform();
+    vi.spyOn(platform, "resolveApplication").mockResolvedValue(
+      ok({ name: "Terminal", bundleId: "com.apple.Terminal", location: "system" }),
+    );
+    const startSession = vi.spyOn(platform, "startSession");
+    const gateway = new Gateway({
+      image: platform,
+      vm: platform,
+      guest: platform,
+      desktop: platform,
+      evidence: new LocalEvidenceAdapter(join(root, "evidence"), join(root, "state"), 10_000),
+      clock: new TestClock(),
+      ids: new TestIds(),
+      ...support,
+      lock: { acquire: async () => ok(async () => undefined) },
+      buildVersion: "test",
+    });
+    const result = await gateway.executeInteractive(
+      config(root),
+      [{ kind: "visible", query: { role: "window" } }],
+      async () => undefined,
+      new AbortController().signal,
+      undefined,
+      { name: "Terminal" },
+    );
+    expect(result.ok && result.value.result).toEqual({
+      verdict: "inconclusive",
+      evidence: "complete",
+      cleanup: "completed",
+    });
+    expect(startSession).not.toHaveBeenCalled();
+    expect(platform.destroyed).toBe(true);
   });
   it("keeps event sequence contiguous when a Hook contribution fails to persist", async () => {
     const root = await mkdtemp(join(tmpdir(), "mcu-hook-artifact-"));
@@ -823,6 +1013,199 @@ describe("gateway", () => {
     expect(result.ok && result.value.evidenceComplete).toBe(false);
     expect(result.ok && result.value.artifacts?.length).toBe(2);
   });
+  it("retries only the after Observation and never replays a successful action", async () => {
+    const root = await mkdtemp(join(tmpdir(), "mcu-after-retry-"));
+    roots.push(root);
+    const platform = new FakePlatform();
+    const observe = platform.observe.bind(platform);
+    const originalDispatch = platform.dispatch.bind(platform);
+    let dispatched = false;
+    let afterObservations = 0;
+    vi.spyOn(platform, "observe").mockImplementation(async (request, signal) => {
+      if (dispatched && ++afterObservations === 1)
+        return {
+          ok: false,
+          error: {
+            code: "ProviderFailure",
+            phase: "observe",
+            message: "Transient after Observation failure.",
+            retryDisposition: "safe",
+          },
+        };
+      return observe(request, signal);
+    });
+    const dispatch = vi.spyOn(platform, "dispatch").mockImplementation(async (...args) => {
+      const result = await originalDispatch(...args);
+      dispatched = true;
+      return result;
+    });
+    const evidence = new LocalEvidenceAdapter(join(root, "evidence"), join(root, "state"), 10_000);
+    const started = await evidence.append({
+      schemaVersion: 1,
+      runId: "run-00000001" as RunId,
+      sequence: 1,
+      recordedAt: "2026-09-21T00:00:00.000Z",
+      elapsedMs: 0,
+      type: "RunStarted",
+      source: "kernel",
+      data: { mode: "interactive" },
+    });
+    if (!started.ok) throw new Error(started.error.message);
+    const transaction = new ActionTransaction(
+      platform,
+      evidence,
+      new TestClock(),
+      new TestIds(),
+      { actionMs: 1000, observeMs: 1000, assertionMs: 1000 },
+      [],
+      { maxAttempts: 2, backoffMs: 0 },
+    );
+    const result = await transaction.execute(
+      {
+        runId: "run-00000001" as RunId,
+        generation: 1,
+        sessionId: "session-0001" as Observation["sessionId"],
+        windowId: "window-0001" as Observation["windowId"],
+        expectedObservationId: "observation-0001",
+        sequence: 1,
+        startedMono: 0,
+      },
+      { kind: "pressKey", key: "enter" },
+      [],
+      new AbortController().signal,
+    );
+    expect(result.ok && result.value.after?.observationId).toMatch(/^observation-/);
+    expect(result.ok && result.value.failure).toBeUndefined();
+    expect(dispatch).toHaveBeenCalledOnce();
+    expect(afterObservations).toBe(2);
+  });
+  it("persists display screenshot scope without labeling it as a window screenshot", async () => {
+    const root = await mkdtemp(join(tmpdir(), "mcu-display-scope-"));
+    roots.push(root);
+    const platform = new FakePlatform();
+    const observe = platform.observe.bind(platform);
+    vi.spyOn(platform, "observe").mockImplementation(async (request, signal) => {
+      const captured = await observe(request, signal);
+      if (!captured.ok) return captured;
+      return ok({
+        ...captured.value,
+        observation: { ...captured.value.observation, screenshotScope: "display" as const },
+      });
+    });
+    const evidence = new LocalEvidenceAdapter(join(root, "evidence"), join(root, "state"), 10_000);
+    const gateway = new Gateway({
+      image: platform,
+      vm: platform,
+      guest: platform,
+      desktop: platform,
+      evidence,
+      clock: new TestClock(),
+      ids: new TestIds(),
+      ...support,
+      lock: { acquire: async () => ok(async () => undefined) },
+      buildVersion: "test",
+    });
+    const result = await gateway.executeInteractive(
+      config(root),
+      [{ kind: "visible", query: { role: "button" } }],
+      async () => undefined,
+      new AbortController().signal,
+    );
+    if (!result.ok) throw new Error(result.error.message);
+    const shown = await evidence.showRun(result.value.runId);
+    if (!shown.ok) throw new Error(shown.error.message);
+    expect(shown.value.artifacts.some((artifact) => artifact.type === "display-screenshot")).toBe(true);
+    expect(shown.value.artifacts.some((artifact) => artifact.type === "window-screenshot")).toBe(false);
+    const timeline = await evidence.readTimeline(result.value.runId);
+    expect(
+      timeline.ok &&
+        timeline.value.some(
+          (event) => event.type === "ObservationCaptured" && event.data.screenshotScope === "display",
+        ),
+    ).toBe(true);
+  });
+
+  it("preserves the earliest safe after-Observation error when backoff reaches the stage deadline", async () => {
+    const root = await mkdtemp(join(tmpdir(), "mcu-after-retry-exhausted-"));
+    roots.push(root);
+    const platform = new FakePlatform();
+    const observe = platform.observe.bind(platform);
+    const originalDispatch = platform.dispatch.bind(platform);
+    let dispatched = false;
+    let afterObservations = 0;
+    vi.spyOn(platform, "observe").mockImplementation(async (request, signal) => {
+      if (dispatched) {
+        afterObservations += 1;
+        return {
+          ok: false,
+          error: {
+            code: "SessionUnavailable",
+            phase: "observe",
+            message: "Mac2 observation could not be captured.",
+            retryDisposition: "safe",
+          },
+        };
+      }
+      return observe(request, signal);
+    });
+    const dispatch = vi.spyOn(platform, "dispatch").mockImplementation(async (...args) => {
+      const result = await originalDispatch(...args);
+      dispatched = true;
+      return result;
+    });
+    const evidence = new LocalEvidenceAdapter(join(root, "evidence"), join(root, "state"), 10_000);
+    const started = await evidence.append({
+      schemaVersion: 1,
+      runId: "run-00000001" as RunId,
+      sequence: 1,
+      recordedAt: "2026-09-21T00:00:00.000Z",
+      elapsedMs: 0,
+      type: "RunStarted",
+      source: "kernel",
+      data: { mode: "interactive" },
+    });
+    if (!started.ok) throw new Error(started.error.message);
+    const clock = new TestClock();
+    let sleeps = 0;
+    clock.sleep = async (_delayMs, signal) => {
+      sleeps += 1;
+      if (sleeps === 1) return;
+      await new Promise<void>((_resolve, reject) =>
+        signal.addEventListener("abort", () => reject(new Error("retry backoff aborted")), { once: true }),
+      );
+    };
+    const transaction = new ActionTransaction(
+      platform,
+      evidence,
+      clock,
+      new TestIds(),
+      { actionMs: 1000, observeMs: 100, assertionMs: 1000 },
+      [],
+      { maxAttempts: 2, backoffMs: 1000 },
+    );
+    const result = await transaction.execute(
+      {
+        runId: "run-00000001" as RunId,
+        generation: 1,
+        sessionId: "session-0001" as Observation["sessionId"],
+        windowId: "window-0001" as Observation["windowId"],
+        expectedObservationId: "observation-0001",
+        sequence: 1,
+        startedMono: 0,
+      },
+      { kind: "pressKey", key: "enter" },
+      [],
+      new AbortController().signal,
+    );
+    expect(result.ok && result.value.result).toMatchObject({
+      dispatch: "dispatched",
+      providerOutcome: "succeeded",
+      verification: "unverifiable",
+    });
+    expect(result.ok && result.value.failure).toMatchObject({ code: "SessionUnavailable" });
+    expect(dispatch).toHaveBeenCalledOnce();
+    expect(afterObservations).toBe(1);
+  });
   it("attempts and persists an after Observation when dispatch returns an error", async () => {
     const root = await mkdtemp(join(tmpdir(), "mcu-receipt-error-after-"));
     roots.push(root);
@@ -873,6 +1256,58 @@ describe("gateway", () => {
     const timeline = await evidence.readTimeline(runId);
     expect(timeline.ok && timeline.value.some((event) => event.type === "ObservationCaptured")).toBe(true);
     expect(timeline.ok && timeline.value.some((event) => event.type === "ActionResultRecorded")).toBe(true);
+  });
+  it("preserves reconcile-required disposition after a partially dispatched text action", async () => {
+    const root = await mkdtemp(join(tmpdir(), "mcu-partial-text-reconcile-"));
+    roots.push(root);
+    const platform = new FakePlatform();
+    vi.spyOn(platform, "dispatch").mockResolvedValue({
+      ok: false,
+      error: {
+        code: "SessionUnavailable",
+        phase: "action",
+        message: "Text dispatch stopped after one or more characters.",
+        retryDisposition: "reconcileRequired",
+        dispatch: "dispatched",
+      },
+    });
+    const evidence = new LocalEvidenceAdapter(join(root, "evidence"), join(root, "state"), 10_000);
+    const runId = "run-00000001" as RunId;
+    await evidence.append({
+      schemaVersion: 1,
+      runId,
+      sequence: 1,
+      recordedAt: "2026-09-21T00:00:00.000Z",
+      elapsedMs: 0,
+      type: "RunStarted",
+      source: "kernel",
+      data: { mode: "interactive" },
+    });
+    const transaction = new ActionTransaction(platform, evidence, new TestClock(), new TestIds(), {
+      actionMs: 1000,
+      observeMs: 1000,
+      assertionMs: 1000,
+    });
+    const result = await transaction.execute(
+      {
+        runId,
+        generation: 1,
+        sessionId: "session-0001" as Observation["sessionId"],
+        windowId: "window-0001" as Observation["windowId"],
+        expectedObservationId: "observation-0001",
+        sequence: 1,
+        startedMono: 0,
+      },
+      { kind: "typeText", value: { literal: "ABC" } },
+      [],
+      new AbortController().signal,
+    );
+    expect(result.ok && result.value.result).toMatchObject({
+      dispatch: "dispatched",
+      providerOutcome: "unknown",
+      verification: "unverifiable",
+      retryDisposition: "reconcileRequired",
+    });
   });
   it.each(["ProviderReceiptRecorded", "ObservationCaptured"] as const)(
     "preserves known post-dispatch facts when %s Evidence fails",

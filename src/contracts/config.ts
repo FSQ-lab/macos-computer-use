@@ -3,7 +3,7 @@ import { WindowQuerySchema } from "./observation.js";
 
 export const TimeoutConfigSchema = z
   .object({
-    runTotalMs: z.number().int().min(1_000).max(86_400_000),
+    runTotalMs: z.literal(7_200_000),
     imagePullMs: z.number().int().positive(),
     cloneMs: z.number().int().positive(),
     vmBootMs: z.number().int().positive(),
@@ -15,7 +15,7 @@ export const TimeoutConfigSchema = z
     actionMs: z.number().int().positive(),
     assertionMs: z.number().int().positive(),
     evidenceFinalizeMs: z.number().int().positive(),
-    cleanupMs: z.number().int().positive(),
+    cleanupMs: z.literal(120_000),
   })
   .strict();
 
@@ -84,7 +84,7 @@ export const GatewayConfigSchema = z
       .default({
         imagePull: { maxAttempts: 2, backoffMs: 500 },
         readiness: { maxAttempts: 10, backoffMs: 1000 },
-        observation: { maxAttempts: 2, backoffMs: 250 },
+        observation: { maxAttempts: 5, backoffMs: 3_000 },
       }),
     network: z.array(NetworkRuleSchema).default([]),
     secrets: z
@@ -96,10 +96,10 @@ export const GatewayConfigSchema = z
         tart: z.literal("2.35").default("2.35"),
         appiumMajor: z.literal(3).default(3),
         appium: z.literal("3.7.0").default("3.7.0"),
-        mac2: z.literal("4.3.1").default("4.3.1"),
+        mac2: z.literal("4.3.5").default("4.3.5"),
         wdaSha256: z
-          .literal("bad71dfeaaa51d3a7224f022c580cdb7424565ca0c4b7f72ad4b0c2b9a339b62")
-          .default("bad71dfeaaa51d3a7224f022c580cdb7424565ca0c4b7f72ad4b0c2b9a339b62"),
+          .literal("094e95c782c034d5755a4056e55ae6e98284e9f2339f15b210a1309c4f46b733")
+          .default("094e95c782c034d5755a4056e55ae6e98284e9f2339f15b210a1309c4f46b733"),
         guestMacOS: z.string().regex(/^\d+\.\d+(?:\.\d+)?$/),
         xcode: z.string().regex(/^\d+\.\d+(?:\.\d+)?$/),
         fixtureBuild: z.string().regex(/^[0-9A-Za-z._-]+$/),
@@ -109,8 +109,8 @@ export const GatewayConfigSchema = z
         tart: "2.35",
         appiumMajor: 3,
         appium: "3.7.0",
-        mac2: "4.3.1",
-        wdaSha256: "bad71dfeaaa51d3a7224f022c580cdb7424565ca0c4b7f72ad4b0c2b9a339b62",
+        mac2: "4.3.5",
+        wdaSha256: "094e95c782c034d5755a4056e55ae6e98284e9f2339f15b210a1309c4f46b733",
         guestMacOS: "26.0",
         xcode: "26.0",
         fixtureBuild: "1",
@@ -124,6 +124,12 @@ export const GatewayConfigSchema = z
         ctx.addIssue({ code: "custom", path: ["timeouts", key], message: "stage timeout exceeds run total" });
     if (v.evidence.maxArtifactBytes > v.evidence.maxRunBytes)
       ctx.addIssue({ code: "custom", path: ["evidence"], message: "artifact limit exceeds run limit" });
+    if (v.network.length > 0)
+      ctx.addIssue({
+        code: "custom",
+        path: ["network"],
+        message: "Nonempty network rules are unsupported in the shared-network profile.",
+      });
   });
 
 export type GatewayConfig = z.infer<typeof GatewayConfigSchema>;

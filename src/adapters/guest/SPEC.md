@@ -12,12 +12,13 @@ Implement GuestPort through `tart exec`: prove Guest readiness, start/stop the G
 
 ## Public Interface
 
-GuestPort exposes fixed typed operations for live probes, known service lifecycle, compatibility metadata, and diagnostic export. It never accepts a shell string or arbitrary executable/arguments from Scenario or Public Client. Appium endpoint, Guest credentials, processes, paths, and native identifiers remain private.
+GuestPort exposes fixed typed operations for live probes, installed-application resolution, known service lifecycle, compatibility metadata, and diagnostic export. `resolveApplication` accepts only ApplicationTarget and returns one neutral ApplicationDescriptor. It never accepts a path, bundle ID, shell string, or arbitrary executable/arguments from Scenario or Public Client. Appium endpoint, application paths, Guest credentials, processes, and native identifiers remain private.
 
 ## Data And State Flow
 
-- Guest readiness runs on the fresh disposable clone and proves the Guest Agent, user desktop session, required executables, Appium patch, Mac2/WDA identity, Fixture identity, and fixed compatibility metadata through live commands. Session/source/window readiness then proves usable automation permission before any business action. These live facts cannot be obtained before clone allocation; Host/static compatibility and exact OCI digest cache identity are the pre-allocation gate.
-- `/etc/macos-computer-use/image-digest` contains an independent image build identity, not the final OCI manifest digest. Guest readiness validates it and Fixture/toolchain metadata against Host expectations bound to the configured immutable OCI digest; Host image verification owns final OCI digest validation.
+- Guest readiness runs on the fresh disposable clone and proves the Guest Agent, desktop session, required executables, exact Appium 3.7.0, exact Mac2 4.3.5, the configured WDA source SHA-256, and fixed image compatibility metadata. Application resolution and later session/source/window readiness prove selected-application identity and automation permission before business work.
+- `/etc/macos-computer-use/image-digest` contains independent image build identity. Guest readiness validates it and toolchain metadata against Host expectations. Fixture metadata is read only by Fixture-specific acceptance.
+- Application resolution runs fixed bounded enumeration over declared standard application roots, accepts only regular `.app` bundle directories, performs exact normalized bundle-directory-name matching, reads the unique match's Info.plist through fixed argument-array commands, returns no path, and never launches an application.
 - Appium starts in a Run-specific Guest temporary directory on fixed port 4723. Raw Appium request logging is disabled so SecretRef values are not written before sanitization; exported diagnostics contain only bounded, generated lifecycle summaries and sanitized Guest metadata.
 - Host obtains the Guest address through Tart's Agent resolver; endpoint use is restricted to the active Run.
 - Stop is attempted before VM destruction and is idempotent when the service is absent.
@@ -29,6 +30,7 @@ Export enforces allowed roots, file-count/single-file/total-size limits, regular
 
 - Fixed-command Tart Exec runner.
 - Guest readiness and compatibility probes.
+- Bounded standard-root application inventory and Info.plist resolver.
 - Appium process lifecycle and log ownership.
 - Restricted archive enumeration/stream/export validation.
 
@@ -44,7 +46,7 @@ Malformed/oversized export, symlink, path escape, special file, unknown process 
 
 ## Verification Scope
 
-Tests cover fixed-command enforcement, readiness parsing, endpoint secrecy, Appium start/stop classification, archive limits, traversal/symlink/special-file rejection, duplicate screenshot avoidance, cancellation, and failure sanitization. Provisioned tests use the fixed Golden Image.
+Tests cover fixed-command enforcement, readiness parsing, exact Appium/Mac2/WDA compatibility rejection, inventory-result validation, exact normalized-name matching, standard-root confinement, missing/duplicate results, bounded Info.plist metadata, endpoint secrecy, Appium lifecycle, archive limits, traversal/symlink/special-file rejection, cancellation, and failure sanitization. Provisioned tests use the fixed Mac2 4.3.5 Golden Image.
 
 ## Current Invariants
 
@@ -52,6 +54,6 @@ Tests cover fixed-command enforcement, readiness parsing, endpoint secrecy, Appi
 - Guest temporary data is not a retention store.
 - No Host user directory or writable Evidence directory is shared into Guest.
 
-## Host-only Network Rules
+## Network Profile
 
-V1 NetworkRules constrain only destinations reachable inside the Host-only network. They do not provide Internet access or enable NAT, bridging, public forwarding, or Host-mediated egress. Nonempty rules preserve Tart Host-only mode and constrain Guest traffic by CIDR, port and protocol; the control channel and DHCP remain available. Effective filtering must be verified before business work. Rules never cause automatic network relaxation.
+GuestPort retains `configureNetwork` for Port compatibility. With the only valid configuration `network: []`, it returns the existing successful no-op receipt. Nonempty rules are rejected at GatewayConfig validation and are not applied. GuestPort still owns no arbitrary networking command and exposes no endpoint publicly.

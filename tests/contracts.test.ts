@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
   ActionResultSchema,
+  ApplicationTargetSchema,
   DesktopActionSchema,
   ElementQuerySchema,
   EvidenceEventSchema,
@@ -22,6 +23,24 @@ const ref = {
 };
 
 describe("contracts", () => {
+  it("accepts display names while rejecting bundle IDs, paths, and patterns", () => {
+    expect(ApplicationTargetSchema.parse({ name: "  Safari  " })).toEqual({ name: "Safari" });
+    expect(ApplicationTargetSchema.parse({ name: "Acme.App 2" })).toEqual({ name: "Acme.App 2" });
+    for (const name of [
+      "com.apple.Safari",
+      "/Applications/Safari.app",
+      "Safari.app",
+      "Saf*",
+      "~Safari",
+      "Safari~",
+      "Safari|TextEdit",
+      `Safari${String.fromCodePoint(0x202e)}`,
+      "😀".repeat(201),
+    ])
+      expect(() => ApplicationTargetSchema.parse({ name })).toThrow();
+    expect(ApplicationTargetSchema.parse({ name: "😀".repeat(200) }).name).toHaveLength(400);
+  });
+
   it("requires typed action and operation identities in durable action facts", () => {
     const base = {
       schemaVersion: 1 as const,
@@ -120,7 +139,7 @@ describe("contracts", () => {
       },
       aut: { bundleId: "com.example.TestApp", window: { isMain: true } },
       timeouts: {
-        runTotalMs: 100_000,
+        runTotalMs: 7_200_000,
         imagePullMs: 1_000,
         cloneMs: 1_000,
         vmBootMs: 1_000,
@@ -132,7 +151,7 @@ describe("contracts", () => {
         actionMs: 1_000,
         assertionMs: 1_000,
         evidenceFinalizeMs: 1_000,
-        cleanupMs: 1_000,
+        cleanupMs: 120_000,
       },
       state: { root: "/tmp/state", tempRoot: "/tmp/temp" },
       evidence: { root: "/tmp/evidence", retentionDays: 7, maxArtifactBytes: 10, maxRunBytes: 100 },
@@ -147,14 +166,26 @@ describe("contracts", () => {
         tart: "2.35",
         appiumMajor: 3,
         appium: "3.7.0",
-        mac2: "4.3.1",
-        wdaSha256: "bad71dfeaaa51d3a7224f022c580cdb7424565ca0c4b7f72ad4b0c2b9a339b62",
+        mac2: "4.3.5",
+        wdaSha256: "094e95c782c034d5755a4056e55ae6e98284e9f2339f15b210a1309c4f46b733",
         guestMacOS: "26.0",
         xcode: "26.0",
         fixtureBuild: "1",
       },
     };
     expect(GatewayConfigSchema.parse(base)).toBeTruthy();
+    expect(
+      GatewayConfigSchema.safeParse({
+        ...base,
+        timeouts: { ...base.timeouts, runTotalMs: 600_000 },
+      }).success,
+    ).toBe(false);
+    expect(
+      GatewayConfigSchema.safeParse({
+        ...base,
+        timeouts: { ...base.timeouts, cleanupMs: 60_000 },
+      }).success,
+    ).toBe(false);
     expect(
       GatewayConfigSchema.safeParse({ ...base, image: { ...base.image, buildIdentity: undefined } }).success,
     ).toBe(false);

@@ -1,5 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { TartAdapter } from "../src/adapters/tart/index.js";
+import { TartAdapter, tartRunArguments } from "../src/adapters/tart/index.js";
 import { runProcess } from "../src/adapters/tart/process-runner.js";
 
 vi.mock("../src/adapters/tart/process-runner.js", () => ({ runProcess: vi.fn() }));
@@ -7,6 +7,12 @@ vi.mock("../src/adapters/tart/process-runner.js", () => ({ runProcess: vi.fn() }
 describe("Tart conservative resource facts", () => {
   const ids = { next: (prefix: string) => `${prefix}-00000001` };
   beforeEach(() => vi.mocked(runProcess).mockReset());
+  it("uses shared networking while disabling clipboard and forwarding modes", () => {
+    const args = tartRunArguments("mcu-run-00000001");
+    expect(args).toEqual(["run", "--no-clipboard", "mcu-run-00000001"]);
+    expect(args).not.toContain("--net-host");
+    expect(args.some((arg) => arg.startsWith("--net-bridged") || arg.includes("expose"))).toBe(false);
+  });
   it("does not treat an unavailable OCI inventory as a missing image", async () => {
     vi.mocked(runProcess).mockResolvedValue({ code: 1, stdout: "", stderr: "", aborted: false });
     const result = await new TartAdapter("tart", ids).checkImage(

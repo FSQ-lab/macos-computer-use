@@ -27,6 +27,7 @@ export class FakePlatform implements ImagePort, VmPort, GuestPort, DesktopPort {
   stoppedAppium = false;
   failSessionCleanup = false;
   assertionStatus: "passed" | "failed" | "unverifiable" = "passed";
+  sessionRequest: Parameters<DesktopPort["startSession"]>[0] | undefined;
   #ignore(..._values: unknown[]): void {
     void _values;
   }
@@ -71,8 +72,8 @@ export class FakePlatform implements ImagePort, VmPort, GuestPort, DesktopPort {
         guestMacOS: "26.0",
         xcode: "26.0",
         appium: "3.7.0",
-        mac2: "4.3.1",
-        wdaSha256: "bad71dfeaaa51d3a7224f022c580cdb7424565ca0c4b7f72ad4b0c2b9a339b62",
+        mac2: "4.3.5",
+        wdaSha256: "094e95c782c034d5755a4056e55ae6e98284e9f2339f15b210a1309c4f46b733",
         buildIdentity: "fixture-build-1",
         fixtureBuild: "1",
         bundleId: "com.example.App",
@@ -83,6 +84,22 @@ export class FakePlatform implements ImagePort, VmPort, GuestPort, DesktopPort {
   async configureNetwork(resourceId?: string, rules?: unknown, signal?: AbortSignal) {
     this.#ignore(resourceId, rules, signal);
     return ok(fakeReceipt());
+  }
+  resolveApplication(
+    resourceId?: string,
+    target?: { name: string },
+    signal?: AbortSignal,
+  ): ReturnType<GuestPort["resolveApplication"]> {
+    this.#ignore(resourceId, signal);
+    return Promise.resolve(
+      ok({
+        name: target?.name ?? "App",
+        bundleId: "com.example.App",
+        version: "1.0",
+        build: "1",
+        location: "system" as const,
+      }),
+    );
   }
   async startAppium(resourceId?: string, signal?: AbortSignal) {
     this.#ignore(resourceId, signal);
@@ -97,8 +114,9 @@ export class FakePlatform implements ImagePort, VmPort, GuestPort, DesktopPort {
     this.#ignore(resourceId, limits, signal);
     return ok(new Uint8Array());
   }
-  async startSession(request?: unknown, signal?: AbortSignal) {
-    this.#ignore(request, signal);
+  async startSession(request: Parameters<DesktopPort["startSession"]>[0], signal?: AbortSignal) {
+    this.#ignore(signal);
+    this.sessionRequest = request;
     if (signal?.aborted)
       return {
         ok: false as const,
@@ -163,6 +181,7 @@ export class FakePlatform implements ImagePort, VmPort, GuestPort, DesktopPort {
       sessionId: request.sessionId,
       windowId: request.windowId,
       capturedAt: "2026-09-21T00:00:00.000Z",
+      screenshotScope: "window",
       coverage: "complete",
       elements: [
         {

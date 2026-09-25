@@ -12,10 +12,107 @@ import {
 } from "../src/contracts/index.js";
 
 const xml = `<?xml version="1.0"?><XCUIElementTypeApplication type="XCUIElementTypeApplication"><XCUIElementTypeWindow type="XCUIElementTypeWindow" title="Main" focused="true" x="0" y="0" width="800" height="600"><XCUIElementTypeButton type="XCUIElementTypeButton" identifier="save" title="Save" enabled="true" x="10" y="20" width="100" height="40"/></XCUIElementTypeWindow></XCUIElementTypeApplication>`;
+const checkboxXml = (value: "0" | "1", selected: "false" | "true") =>
+  `<?xml version="1.0"?><XCUIElementTypeApplication type="XCUIElementTypeApplication"><XCUIElementTypeWindow type="XCUIElementTypeWindow" title="Main" focused="true" x="0" y="0" width="800" height="600"><XCUIElementTypeCheckBox type="XCUIElementTypeCheckBox" identifier="fixture.checkbox" value="${value}" selected="${selected}" enabled="true" x="10" y="20" width="100" height="40"/></XCUIElementTypeWindow></XCUIElementTypeApplication>`;
+const textFieldXml = (value?: string) =>
+  `<?xml version="1.0"?><XCUIElementTypeApplication type="XCUIElementTypeApplication"><XCUIElementTypeWindow type="XCUIElementTypeWindow" title="Main" focused="true" x="0" y="0" width="800" height="600"><XCUIElementTypeTextField type="XCUIElementTypeTextField" identifier="input"${value === undefined ? "" : ` value="${value}"`} enabled="true" x="10" y="20" width="200" height="40"/></XCUIElementTypeWindow></XCUIElementTypeApplication>`;
+const PNG_BYTES = Buffer.from([
+  0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4e, 0x44,
+]);
 let logicalId = 0;
 const ids = { next: (prefix: string) => `${prefix}-${String(++logicalId).padStart(8, "0")}` };
 
 describe("Mac2DesktopAdapter", () => {
+  it("renders the first nonempty element label in compact observations", () => {
+    const adapter = new Mac2DesktopAdapter();
+    const compact = adapter.compact({
+      observationId: "observation-00000001" as never,
+      runId: "run-00000001" as never,
+      environmentId: "environment-1",
+      generation: 1,
+      sessionId: "session-00000001" as never,
+      windowId: "window-00000001" as never,
+      capturedAt: new Date().toISOString(),
+      screenshotScope: "window",
+      screenshot: { artifactId: "artifact-00000001" as never, sha256: "a".repeat(64) },
+      uiSnapshot: { artifactId: "artifact-00000002" as never, sha256: "b".repeat(64) },
+      coverage: "complete",
+      elements: [
+        {
+          elementId: "element-00000001" as never,
+          role: "button",
+          identifier: "fixture.click",
+          name: "",
+          label: "Click",
+          enabled: true,
+        },
+      ],
+    });
+    expect(compact).toContain('button "Click" id="fixture.click" enabled');
+  });
+  it.each([
+    ["1", "false", true],
+    ["0", "true", false],
+  ] as const)(
+    "normalizes checkbox value %s over misleading selected=%s",
+    async (checkboxValue, selectedValue, expected) => {
+      const fetcher: typeof fetch = async (input, init) => {
+        const url = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
+        const body = typeof init?.body === "string" ? (JSON.parse(init.body) as unknown) : undefined;
+        const value = url.endsWith("/timeouts")
+          ? { value: { command: 3_000_000 } }
+          : url.endsWith("/session") && init?.method === "POST"
+            ? { sessionId: "native-session", value: { sessionId: "native-session" } }
+            : url.endsWith("/source")
+              ? { value: checkboxXml(checkboxValue, selectedValue) }
+              : JSON.stringify(body ?? null).includes("macos: screenshots")
+                ? { value: { main: { isMain: true, payload: PNG_BYTES.toString("base64") } } }
+                : url.endsWith("/element/active")
+                  ? { value: { "element-6066-11e4-a52e-4f735466cecf": "native-input" } }
+                  : url.endsWith("/elements")
+                    ? { value: [{ "element-6066-11e4-a52e-4f735466cecf": "native-window" }] }
+                    : JSON.stringify(body ?? null).includes("macos: queryAppState")
+                      ? { value: 4 }
+                      : { value: null };
+        return new Response(JSON.stringify(value), { status: 200 });
+      };
+      const adapter = new Mac2DesktopAdapter(
+        fetcher,
+        undefined,
+        undefined,
+        () => ({ endpoint: "http://guest:4723", elementOriginActions: false }),
+        ids,
+      );
+      const signal = new AbortController().signal;
+      expect(
+        (
+          await adapter.startSession(
+            {
+              channelId: "operation-00000009" as OperationId,
+              bundleId: "com.example.App",
+              window: { title: { exact: "Main" } },
+            },
+            signal,
+          )
+        ).ok,
+      ).toBe(true);
+      const observed = await adapter.observe(
+        {
+          runId: "run-00000001" as RunId,
+          generation: 1,
+          observationId: "observation-00000001" as ObservationId,
+          sessionId: "session-00000001" as SessionId,
+          windowId: "window-00000001" as WindowId,
+        },
+        signal,
+      );
+      expect(observed.ok && observed.value.observation.elements).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({ identifier: "fixture.checkbox", selected: expected }),
+        ]),
+      );
+    },
+  );
   it.each([
     ["unsupported operation", "UnsupportedAction", "notDispatched", "safe"],
     ["invalid argument", "InvalidConfiguration", "unknown", "reconcileRequired"],
@@ -27,17 +124,19 @@ describe("Mac2DesktopAdapter", () => {
       const fetcher: typeof fetch = async (input, init) => {
         const url = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
         const body = typeof init?.body === "string" ? (JSON.parse(init.body) as unknown) : undefined;
-        const value = url.endsWith("/session")
-          ? { sessionId: "native-session", value: { sessionId: "native-session" } }
-          : url.endsWith("/source")
-            ? { value: xml }
-            : url.endsWith("/elements")
-              ? { value: [{ "element-6066-11e4-a52e-4f735466cecf": "native-window" }] }
-              : JSON.stringify(body ?? null).includes("macos: queryAppState")
-                ? { value: 4 }
-                : failKey && JSON.stringify(body ?? null).includes("macos: keys")
-                  ? { value: { error: providerCode } }
-                  : { value: null };
+        const value = url.endsWith("/timeouts")
+          ? { value: { command: 3_000_000 } }
+          : url.endsWith("/session")
+            ? { sessionId: "native-session", value: { sessionId: "native-session" } }
+            : url.endsWith("/source")
+              ? { value: xml }
+              : url.endsWith("/elements")
+                ? { value: [{ "element-6066-11e4-a52e-4f735466cecf": "native-window" }] }
+                : JSON.stringify(body ?? null).includes("macos: queryAppState")
+                  ? { value: 4 }
+                  : failKey && JSON.stringify(body ?? null).includes("macos: keys")
+                    ? { value: { error: providerCode } }
+                    : { value: null };
         return new Response(JSON.stringify(value), { status: 200 });
       };
       const adapter = new Mac2DesktopAdapter(
@@ -72,6 +171,548 @@ describe("Mac2DesktopAdapter", () => {
       ).toMatchObject({ ok: false, error: { code: expectedCode, dispatch, retryDisposition } });
     },
   );
+  it("requests and verifies the fixed Appium new-command timeout", async () => {
+    const calls: { url: string; body?: unknown }[] = [];
+    let effectiveTimeout = 3_000_000;
+    const fetcher: typeof fetch = async (input, init) => {
+      const url = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
+      const body = typeof init?.body === "string" ? (JSON.parse(init.body) as unknown) : undefined;
+      calls.push({ url, ...(body === undefined ? {} : { body }) });
+      const value = url.endsWith("/timeouts")
+        ? { value: { command: effectiveTimeout } }
+        : url.endsWith("/session") && init?.method === "POST"
+          ? { sessionId: "native-session", value: { sessionId: "native-session" } }
+          : url.endsWith("/source")
+            ? { value: xml }
+            : url.endsWith("/elements")
+              ? { value: [{ "element-6066-11e4-a52e-4f735466cecf": "native-window" }] }
+              : JSON.stringify(body ?? null).includes("macos: queryAppState")
+                ? { value: 4 }
+                : { value: null };
+      return new Response(JSON.stringify(value), { status: 200 });
+    };
+    const make = () =>
+      new Mac2DesktopAdapter(
+        fetcher,
+        undefined,
+        undefined,
+        () => ({ endpoint: "http://guest:4723", elementOriginActions: false }),
+        ids,
+      );
+    const request = {
+      channelId: "operation-00000009" as OperationId,
+      bundleId: "com.example.App",
+      window: { title: { exact: "Main" } },
+    };
+    expect((await make().startSession(request, new AbortController().signal)).ok).toBe(true);
+    expect(JSON.stringify(calls.find((call) => call.url.endsWith("/session"))?.body)).toContain(
+      '"appium:newCommandTimeout":3000',
+    );
+    effectiveTimeout = 60_000;
+    expect(await make().startSession(request, new AbortController().signal)).toMatchObject({
+      ok: false,
+      error: { code: "SessionUnavailable", dispatch: "notDispatched" },
+    });
+  });
+  it("uses only the unique Mac2 main-display screenshot", async () => {
+    const calls: string[] = [];
+    const bodies: unknown[] = [];
+    const fetcher: typeof fetch = async (input, init) => {
+      const url = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
+      const body = typeof init?.body === "string" ? (JSON.parse(init.body) as unknown) : undefined;
+      calls.push(url);
+      bodies.push(body);
+      const value = url.endsWith("/timeouts")
+        ? { value: { command: 3_000_000 } }
+        : url.endsWith("/session") && init?.method === "POST"
+          ? { sessionId: "native-session", value: { sessionId: "native-session" } }
+          : url.endsWith("/source")
+            ? { value: xml }
+            : url.endsWith("/elements")
+              ? { value: [{ "element-6066-11e4-a52e-4f735466cecf": "native-window" }] }
+              : JSON.stringify(body ?? null).includes("macos: queryAppState")
+                ? { value: 4 }
+                : JSON.stringify(body ?? null).includes("macos: screenshots")
+                  ? {
+                      value: {
+                        main: {
+                          id: 1,
+                          isMain: true,
+                          payload: PNG_BYTES.toString("base64"),
+                        },
+                      },
+                    }
+                  : { value: null };
+      return new Response(JSON.stringify(value), { status: 200 });
+    };
+    const adapter = new Mac2DesktopAdapter(
+      fetcher,
+      undefined,
+      undefined,
+      () => ({ endpoint: "http://guest:4723", elementOriginActions: false }),
+      ids,
+    );
+    const signal = new AbortController().signal;
+    expect(
+      (
+        await adapter.startSession(
+          {
+            channelId: "operation-00000009" as OperationId,
+            bundleId: "com.example.App",
+            window: { title: { exact: "Main" } },
+          },
+          signal,
+        )
+      ).ok,
+    ).toBe(true);
+    bodies.length = 0;
+    const observed = await adapter.observe(
+      {
+        runId: "run-00000001" as RunId,
+        generation: 1,
+        observationId: "observation-00000001" as ObservationId,
+        sessionId: "session-00000001" as SessionId,
+        windowId: "window-00000001" as WindowId,
+      },
+      signal,
+    );
+    expect(observed.ok && observed.value.observation.screenshotScope).toBe("display");
+    expect(calls.some((url) => /\/element\/[^/]+\/screenshot$/u.test(url))).toBe(false);
+    expect(bodies.filter((body) => JSON.stringify(body ?? null).includes("macos: screenshots"))).toHaveLength(
+      1,
+    );
+  });
+  it("classifies a stopped Mac2 provider process as SessionUnavailable", async () => {
+    let failKey = false;
+    const fetcher: typeof fetch = async (input, init) => {
+      const url = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
+      const body = typeof init?.body === "string" ? (JSON.parse(init.body) as unknown) : undefined;
+      const response =
+        failKey && JSON.stringify(body ?? null).includes("macos: keys")
+          ? {
+              value: {
+                error: "unknown error",
+                message: "Mac2 Driver server process is not running (probably crashed).",
+              },
+            }
+          : url.endsWith("/timeouts")
+            ? { value: { command: 3_000_000 } }
+            : url.endsWith("/session") && init?.method === "POST"
+              ? { sessionId: "native-session", value: { sessionId: "native-session" } }
+              : url.endsWith("/source")
+                ? { value: xml }
+                : url.endsWith("/elements")
+                  ? { value: [{ "element-6066-11e4-a52e-4f735466cecf": "native-window" }] }
+                  : JSON.stringify(body ?? null).includes("macos: queryAppState")
+                    ? { value: 4 }
+                    : { value: null };
+      return new Response(JSON.stringify(response), { status: 200 });
+    };
+    const adapter = new Mac2DesktopAdapter(
+      fetcher,
+      undefined,
+      undefined,
+      () => ({ endpoint: "http://guest:4723", elementOriginActions: false }),
+      ids,
+    );
+    const signal = new AbortController().signal;
+    expect(
+      (
+        await adapter.startSession(
+          {
+            channelId: "operation-00000009" as OperationId,
+            bundleId: "com.example.App",
+            window: { title: { exact: "Main" } },
+          },
+          signal,
+        )
+      ).ok,
+    ).toBe(true);
+    failKey = true;
+    expect(
+      await adapter.dispatch({ kind: "pressKey", key: "enter" }, "operation-00000001" as OperationId, signal),
+    ).toMatchObject({ ok: false, error: { code: "SessionUnavailable" } });
+  });
+  it("classifies a stopped Mac2 provider during observation as SessionUnavailable", async () => {
+    let failSource = false;
+    const fetcher: typeof fetch = async (input, init) => {
+      const url = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
+      const body = typeof init?.body === "string" ? (JSON.parse(init.body) as unknown) : undefined;
+      if (failSource && (url.endsWith("/source") || JSON.stringify(body ?? null).includes("macos: source")))
+        return new Response(
+          JSON.stringify({
+            value: {
+              error: "unknown error",
+              message: "Mac2 Driver server process is not running (probably crashed).",
+            },
+          }),
+          { status: 500 },
+        );
+      const response = url.endsWith("/timeouts")
+        ? { value: { command: 3_000_000 } }
+        : url.endsWith("/session") && init?.method === "POST"
+          ? { sessionId: "native-session", value: { sessionId: "native-session" } }
+          : url.endsWith("/source")
+            ? { value: xml }
+            : url.endsWith("/elements")
+              ? { value: [{ "element-6066-11e4-a52e-4f735466cecf": "native-window" }] }
+              : JSON.stringify(body ?? null).includes("macos: queryAppState")
+                ? { value: 4 }
+                : { value: null };
+      return new Response(JSON.stringify(response), { status: 200 });
+    };
+    const adapter = new Mac2DesktopAdapter(
+      fetcher,
+      undefined,
+      undefined,
+      () => ({ endpoint: "http://guest:4723", elementOriginActions: false }),
+      ids,
+    );
+    const signal = new AbortController().signal;
+    expect(
+      (
+        await adapter.startSession(
+          {
+            channelId: "operation-00000009" as OperationId,
+            bundleId: "com.example.App",
+            window: { title: { exact: "Main" } },
+          },
+          signal,
+        )
+      ).ok,
+    ).toBe(true);
+    failSource = true;
+    expect(
+      await adapter.observe(
+        {
+          runId: "run-00000001" as RunId,
+          generation: 1,
+          observationId: "observation-00000001" as ObservationId,
+          sessionId: "session-00000001" as SessionId,
+          windowId: "window-00000001" as WindowId,
+        },
+        signal,
+      ),
+    ).toMatchObject({ ok: false, error: { code: "SessionUnavailable" } });
+  });
+  it("preserves the standard-source error when the Mac2 source fallback also fails", async () => {
+    let failSource = false;
+    const fetcher: typeof fetch = async (input, init) => {
+      const url = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
+      const body = typeof init?.body === "string" ? (JSON.parse(init.body) as unknown) : undefined;
+      if (failSource && url.endsWith("/source"))
+        return new Response(JSON.stringify({ value: { error: "unknown error" } }), { status: 500 });
+      if (failSource && JSON.stringify(body ?? null).includes("macos: source"))
+        return new Response(JSON.stringify({ value: { error: "unsupported operation" } }), { status: 500 });
+      const response = url.endsWith("/timeouts")
+        ? { value: { command: 3_000_000 } }
+        : url.endsWith("/session") && init?.method === "POST"
+          ? { sessionId: "native-session", value: { sessionId: "native-session" } }
+          : url.endsWith("/source")
+            ? { value: xml }
+            : url.endsWith("/elements")
+              ? { value: [{ "element-6066-11e4-a52e-4f735466cecf": "native-window" }] }
+              : JSON.stringify(body ?? null).includes("macos: queryAppState")
+                ? { value: 4 }
+                : { value: null };
+      return new Response(JSON.stringify(response), { status: 200 });
+    };
+    const adapter = new Mac2DesktopAdapter(
+      fetcher,
+      undefined,
+      undefined,
+      () => ({ endpoint: "http://guest:4723", elementOriginActions: false }),
+      ids,
+    );
+    const signal = new AbortController().signal;
+    expect(
+      (
+        await adapter.startSession(
+          {
+            channelId: "operation-00000009" as OperationId,
+            bundleId: "com.example.App",
+            window: { title: { exact: "Main" } },
+          },
+          signal,
+        )
+      ).ok,
+    ).toBe(true);
+    failSource = true;
+    expect(
+      await adapter.observe(
+        {
+          runId: "run-00000001" as RunId,
+          generation: 1,
+          observationId: "observation-00000001" as ObservationId,
+          sessionId: "session-00000001" as SessionId,
+          windowId: "window-00000001" as WindowId,
+        },
+        signal,
+      ),
+    ).toMatchObject({
+      ok: false,
+      error: { message: "Mac2 observation failed at pageSource with provider category providerError." },
+    });
+  });
+  it("uses Mac2 source exactly once when standard source fails", async () => {
+    const bodies: unknown[] = [];
+    const fetcher: typeof fetch = async (input, init) => {
+      const url = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
+      const body = typeof init?.body === "string" ? (JSON.parse(init.body) as unknown) : undefined;
+      bodies.push(body);
+      if (url.endsWith("/source"))
+        return new Response(JSON.stringify({ value: { error: "unknown error" } }), { status: 200 });
+      const value = url.endsWith("/timeouts")
+        ? { value: { command: 3_000_000 } }
+        : url.endsWith("/session") && init?.method === "POST"
+          ? { sessionId: "native-session", value: { sessionId: "native-session" } }
+          : JSON.stringify(body ?? null).includes("macos: screenshots")
+            ? { value: { main: { isMain: true, payload: PNG_BYTES.toString("base64") } } }
+            : url.endsWith("/elements")
+              ? { value: [{ "element-6066-11e4-a52e-4f735466cecf": "native-window" }] }
+              : JSON.stringify(body ?? null).includes("macos: queryAppState")
+                ? { value: 4 }
+                : JSON.stringify(body ?? null).includes("macos: source")
+                  ? { value: xml }
+                  : { value: null };
+      return new Response(JSON.stringify(value), { status: 200 });
+    };
+    const adapter = new Mac2DesktopAdapter(
+      fetcher,
+      undefined,
+      undefined,
+      () => ({ endpoint: "http://guest:4723", elementOriginActions: false }),
+      ids,
+    );
+    const signal = new AbortController().signal;
+    expect(
+      (
+        await adapter.startSession(
+          {
+            channelId: "operation-00000009" as OperationId,
+            bundleId: "com.example.App",
+            window: { title: { exact: "Main" } },
+          },
+          signal,
+        )
+      ).ok,
+    ).toBe(true);
+    bodies.length = 0;
+    const observed = await adapter.observe(
+      {
+        runId: "run-00000001" as RunId,
+        generation: 1,
+        observationId: "observation-00000001" as ObservationId,
+        sessionId: "session-00000001" as SessionId,
+        windowId: "window-00000001" as WindowId,
+      },
+      signal,
+    );
+    expect(observed.ok).toBe(true);
+    expect(bodies.filter((body) => JSON.stringify(body ?? null).includes("macos: source"))).toHaveLength(1);
+  });
+  it("rejects text actions against non-text elements before provider dispatch", async () => {
+    const calls: string[] = [];
+    const fetcher: typeof fetch = async (input, init) => {
+      const url = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
+      const body = typeof init?.body === "string" ? (JSON.parse(init.body) as unknown) : undefined;
+      calls.push(url);
+      const value = url.endsWith("/timeouts")
+        ? { value: { command: 3_000_000 } }
+        : url.endsWith("/session") && init?.method === "POST"
+          ? { sessionId: "native-session", value: { sessionId: "native-session" } }
+          : url.endsWith("/source")
+            ? { value: xml }
+            : JSON.stringify(body ?? null).includes("macos: screenshots")
+              ? { value: { main: { isMain: true, payload: PNG_BYTES.toString("base64") } } }
+              : url.endsWith("/elements")
+                ? !JSON.stringify(body).includes("//XCUIElementTypeTextField")
+                  ? { value: [{ "element-6066-11e4-a52e-4f735466cecf": "native-window" }] }
+                  : { value: [{ "element-6066-11e4-a52e-4f735466cecf": "native-save" }] }
+                : url.endsWith("/element/native-save/displayed")
+                  ? { value: true }
+                  : JSON.stringify(body ?? null).includes("macos: queryAppState")
+                    ? { value: 4 }
+                    : { value: null };
+      return new Response(JSON.stringify(value), { status: 200 });
+    };
+    const adapter = new Mac2DesktopAdapter(
+      fetcher,
+      undefined,
+      undefined,
+      () => ({ endpoint: "http://guest:4723", elementOriginActions: false }),
+      ids,
+    );
+    const signal = new AbortController().signal;
+    const started = await adapter.startSession(
+      {
+        channelId: "operation-00000009" as OperationId,
+        bundleId: "com.example.App",
+        window: { title: { exact: "Main" } },
+      },
+      signal,
+    );
+    expect(started.ok).toBe(true);
+    const observed = await adapter.observe(
+      {
+        runId: "run-00000001" as RunId,
+        generation: 1,
+        observationId: "observation-00000001" as ObservationId,
+        sessionId: "session-00000001" as SessionId,
+        windowId: "window-00000001" as WindowId,
+      },
+      signal,
+    );
+    if (!observed.ok) throw new Error(observed.error.code);
+    const dispatched = await adapter.dispatch(
+      { kind: "typeText", value: { secret: { name: "TEXT_SECRET", purpose: "textInput" } } },
+      "operation-00000001" as OperationId,
+      signal,
+    );
+    expect(dispatched).toMatchObject({
+      ok: false,
+      error: { code: "InvalidConfiguration", dispatch: "notDispatched" },
+    });
+    expect(calls.some((url) => /\/element\/[^/]+\/value$/u.test(url))).toBe(false);
+  });
+  it("types Unicode code points through separate Mac2 keys commands without element-value writes", async () => {
+    const calls: { url: string; body?: unknown }[] = [];
+    let keyCalls = 0;
+    let failAtKeyCall = Number.POSITIVE_INFINITY;
+    const fetcher: typeof fetch = async (input, init) => {
+      const url = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
+      const body = typeof init?.body === "string" ? (JSON.parse(init.body) as unknown) : undefined;
+      calls.push({ url, ...(body === undefined ? {} : { body }) });
+      const isKeyCall = JSON.stringify(body ?? null).includes("macos: keys");
+      if (isKeyCall) keyCalls += 1;
+      const response =
+        keyCalls === failAtKeyCall && isKeyCall
+          ? { value: { error: "invalid session id" } }
+          : url.endsWith("/timeouts")
+            ? { value: { command: 3_000_000 } }
+            : url.endsWith("/session") && init?.method === "POST"
+              ? { sessionId: "native-session", value: { sessionId: "native-session" } }
+              : url.endsWith("/source")
+                ? { value: textFieldXml("Alpha") }
+                : JSON.stringify(body ?? null).includes("macos: screenshots")
+                  ? { value: { main: { isMain: true, payload: PNG_BYTES.toString("base64") } } }
+                  : url.endsWith("/elements")
+                    ? !JSON.stringify(body).includes("]//XCUIElementTypeTextField")
+                      ? { value: [{ "element-6066-11e4-a52e-4f735466cecf": "native-window" }] }
+                      : { value: [{ "element-6066-11e4-a52e-4f735466cecf": "native-input" }] }
+                    : url.endsWith("/element/native-input/displayed")
+                      ? { value: true }
+                      : JSON.stringify(body ?? null).includes("macos: queryAppState")
+                        ? { value: 4 }
+                        : { value: null };
+      return new Response(JSON.stringify(response), { status: 200 });
+    };
+    const adapter = new Mac2DesktopAdapter(
+      fetcher,
+      undefined,
+      undefined,
+      () => ({ endpoint: "http://guest:4723", elementOriginActions: false }),
+      ids,
+    );
+    const signal = new AbortController().signal;
+    const started = await adapter.startSession(
+      {
+        channelId: "operation-00000009" as OperationId,
+        bundleId: "com.example.App",
+        window: { title: { exact: "Main" } },
+      },
+      signal,
+    );
+    expect(started.ok).toBe(true);
+    const observed = await adapter.observe(
+      {
+        runId: "run-00000001" as RunId,
+        generation: 1,
+        observationId: "observation-00000001" as ObservationId,
+        sessionId: "session-00000001" as SessionId,
+        windowId: "window-00000001" as WindowId,
+      },
+      signal,
+    );
+    if (!observed.ok) throw new Error(observed.error.code);
+    const result = await adapter.dispatch(
+      { kind: "typeText", value: { literal: "A🙂" } },
+      "operation-00000001" as OperationId,
+      signal,
+    );
+    expect(result.ok).toBe(true);
+    expect(calls.some((call) => /\/element\/[^/]+\/value$/u.test(call.url))).toBe(false);
+    expect(
+      calls
+        .filter((call) => JSON.stringify(call.body ?? null).includes("macos: keys"))
+        .map((call) => call.body),
+    ).toEqual([
+      { script: "macos: keys", args: [{ keys: ["A"] }] },
+      { script: "macos: keys", args: [{ keys: ["🙂"] }] },
+    ]);
+    expect(calls.some((call) => call.url.endsWith("/element/active"))).toBe(false);
+    expect(calls.some((call) => JSON.stringify(call.body ?? null).includes('"elementId"'))).toBe(false);
+    keyCalls = 0;
+    failAtKeyCall = 2;
+    const partial = await adapter.dispatch(
+      { kind: "typeText", value: { literal: "XYZ" } },
+      "operation-00000002" as OperationId,
+      signal,
+    );
+    expect(partial).toMatchObject({
+      ok: false,
+      error: { code: "SessionUnavailable", dispatch: "dispatched", retryDisposition: "reconcileRequired" },
+    });
+    expect(keyCalls).toBe(2);
+  });
+  it("uses the same application-scoped typeText path without an active-element probe", async () => {
+    const bodies: unknown[] = [];
+    const fetcher: typeof fetch = async (input, init) => {
+      const url = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
+      const body = typeof init?.body === "string" ? (JSON.parse(init.body) as unknown) : undefined;
+      bodies.push(body);
+      const response = url.endsWith("/timeouts")
+        ? { value: { command: 3_000_000 } }
+        : url.endsWith("/session") && init?.method === "POST"
+          ? { sessionId: "native-session", value: { sessionId: "native-session" } }
+          : url.endsWith("/source")
+            ? { value: textFieldXml("") }
+            : url.endsWith("/elements")
+              ? { value: [{ "element-6066-11e4-a52e-4f735466cecf": "native-window" }] }
+              : JSON.stringify(body ?? null).includes("macos: queryAppState")
+                ? { value: 4 }
+                : { value: null };
+      return new Response(JSON.stringify(response), { status: 200 });
+    };
+    const adapter = new Mac2DesktopAdapter(
+      fetcher,
+      undefined,
+      undefined,
+      () => ({ endpoint: "http://guest:4723", elementOriginActions: false }),
+      ids,
+    );
+    const signal = new AbortController().signal;
+    expect(
+      (
+        await adapter.startSession(
+          {
+            channelId: "operation-00000009" as OperationId,
+            bundleId: "com.example.App",
+            window: { title: { exact: "Main" } },
+          },
+          signal,
+        )
+      ).ok,
+    ).toBe(true);
+    expect(
+      await adapter.dispatch(
+        { kind: "typeText", value: { literal: "hello" } },
+        "operation-00000001" as OperationId,
+        signal,
+      ),
+    ).toMatchObject({ ok: true });
+    expect(bodies.filter((body) => JSON.stringify(body ?? null).includes("macos: keys"))).toHaveLength(5);
+  });
   it("keeps the session usable when element-origin capability probing is unsupported", async () => {
     let probeFailed = false;
     const fetcher: typeof fetch = async (input, init) => {
@@ -81,15 +722,17 @@ describe("Mac2DesktopAdapter", () => {
         probeFailed = true;
         return new Response(JSON.stringify({ value: { error: "unsupported operation" } }), { status: 200 });
       }
-      const value = url.endsWith("/session")
-        ? { sessionId: "native-session", value: { sessionId: "native-session" } }
-        : url.endsWith("/source")
-          ? { value: xml }
-          : url.endsWith("/elements")
-            ? { value: [{ "element-6066-11e4-a52e-4f735466cecf": "native-window" }] }
-            : JSON.stringify(body ?? null).includes("macos: queryAppState")
-              ? { value: 4 }
-              : { value: null };
+      const value = url.endsWith("/timeouts")
+        ? { value: { command: 3_000_000 } }
+        : url.endsWith("/session")
+          ? { sessionId: "native-session", value: { sessionId: "native-session" } }
+          : url.endsWith("/source")
+            ? { value: xml }
+            : url.endsWith("/elements")
+              ? { value: [{ "element-6066-11e4-a52e-4f735466cecf": "native-window" }] }
+              : JSON.stringify(body ?? null).includes("macos: queryAppState")
+                ? { value: 4 }
+                : { value: null };
       return new Response(JSON.stringify(value), { status: 200 });
     };
     const adapter = new Mac2DesktopAdapter(
@@ -124,25 +767,27 @@ describe("Mac2DesktopAdapter", () => {
     const fetcher: typeof fetch = async (input, init) => {
       const url = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
       const body = typeof init?.body === "string" ? (JSON.parse(init.body) as unknown) : undefined;
-      const value = url.endsWith("/session")
-        ? { sessionId: "native-session", value: { sessionId: "native-session" } }
-        : url.endsWith("/source")
-          ? { value: xml }
-          : url.endsWith("/element/native-window/screenshot")
-            ? { value: Buffer.from("png").toString("base64") }
-            : url.endsWith("/elements")
-              ? JSON.stringify(body).includes("XCUIElementTypeWindow")
-                ? { value: [{ "element-6066-11e4-a52e-4f735466cecf": "native-window" }] }
-                : { value: [{ "element-6066-11e4-a52e-4f735466cecf": "native-save" }] }
-              : url.endsWith("/element/native-save/displayed")
-                ? { value: true }
-                : url.endsWith("/element/native-save/rect")
-                  ? { value: { x: 0, y: 0, width: 100, height: 40 } }
-                  : JSON.stringify(body ?? null).includes("macos: queryAppState")
-                    ? { value: 4 }
-                    : failClick && JSON.stringify(body ?? null).includes("macos: click")
-                      ? { value: { error: "unsupported operation" } }
-                      : { value: null };
+      const value = url.endsWith("/timeouts")
+        ? { value: { command: 3_000_000 } }
+        : url.endsWith("/session")
+          ? { sessionId: "native-session", value: { sessionId: "native-session" } }
+          : url.endsWith("/source")
+            ? { value: xml }
+            : JSON.stringify(body ?? null).includes("macos: screenshots")
+              ? { value: { main: { isMain: true, payload: PNG_BYTES.toString("base64") } } }
+              : url.endsWith("/elements")
+                ? !JSON.stringify(body).includes("]//XCUIElementTypeButton")
+                  ? { value: [{ "element-6066-11e4-a52e-4f735466cecf": "native-window" }] }
+                  : { value: [{ "element-6066-11e4-a52e-4f735466cecf": "native-save" }] }
+                : url.endsWith("/element/native-save/displayed")
+                  ? { value: true }
+                  : url.endsWith("/element/native-save/rect")
+                    ? { value: { x: 0, y: 0, width: 100, height: 40 } }
+                    : JSON.stringify(body ?? null).includes("macos: queryAppState")
+                      ? { value: 4 }
+                      : failClick && JSON.stringify(body ?? null).includes("macos: click")
+                        ? { value: { error: "unsupported operation" } }
+                        : { value: null };
       return new Response(JSON.stringify(value), { status: 200 });
     };
     const adapter = new Mac2DesktopAdapter(
@@ -203,17 +848,19 @@ describe("Mac2DesktopAdapter", () => {
       const url = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
       const body = typeof init?.body === "string" ? (JSON.parse(init.body) as unknown) : undefined;
       calls.push(body);
-      const value = url.endsWith("/session")
-        ? { sessionId: "native-session", value: { sessionId: "native-session" } }
-        : url.endsWith("/status")
-          ? { value: { build: { version: "4.3.1" } } }
-          : url.endsWith("/source")
-            ? { value: xml.replace('focused="true"', 'focused="true" main="true" modal="false"') }
-            : url.endsWith("/elements")
-              ? { value: [{ "element-6066-11e4-a52e-4f735466cecf": "native-window" }] }
-              : JSON.stringify(body ?? null).includes("macos: queryAppState")
-                ? { value: 4 }
-                : { value: null };
+      const value = url.endsWith("/timeouts")
+        ? { value: { command: 3_000_000 } }
+        : url.endsWith("/session")
+          ? { sessionId: "native-session", value: { sessionId: "native-session" } }
+          : url.endsWith("/status")
+            ? { value: { build: { version: "4.3.5" } } }
+            : url.endsWith("/source")
+              ? { value: xml.replace('focused="true"', 'focused="true" main="true" modal="false"') }
+              : url.endsWith("/elements")
+                ? { value: [{ "element-6066-11e4-a52e-4f735466cecf": "native-window" }] }
+                : JSON.stringify(body ?? null).includes("macos: queryAppState")
+                  ? { value: 4 }
+                  : { value: null };
       return new Response(JSON.stringify(value), { status: 200 });
     };
     const adapter = new Mac2DesktopAdapter(
@@ -241,8 +888,9 @@ describe("Mac2DesktopAdapter", () => {
     );
     expect(result.ok).toBe(true);
     const request = calls.find((body) => JSON.stringify(body ?? null).includes("XCUIElementTypeWindow"));
-    expect(JSON.stringify(request)).toContain("@type='XCUIElementTypeWindow'");
-    expect(JSON.stringify(request)).toContain("@main='true'");
+    expect(JSON.stringify(request)).toContain("//XCUIElementTypeWindow");
+    expect(JSON.stringify(request)).not.toContain("@type='XCUIElementTypeWindow'");
+    expect(JSON.stringify(request)).toContain("@main='true' or @focused='true'");
     expect(JSON.stringify(request)).toContain("@modal='false'");
   });
   it("uses Mac2 top-left element offsets and bounded canonical identities", async () => {
@@ -252,17 +900,18 @@ describe("Mac2DesktopAdapter", () => {
       const url = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
       const body = typeof init?.body === "string" ? (JSON.parse(init.body) as unknown) : undefined;
       calls.push({ url, ...(body === undefined ? {} : { body }) });
-      const value =
-        url.endsWith("/session") && init?.method === "POST"
+      const value = url.endsWith("/timeouts")
+        ? { value: { command: 3_000_000 } }
+        : url.endsWith("/session") && init?.method === "POST"
           ? { sessionId: "native-session", value: { sessionId: "native-session" } }
           : url.endsWith("/status")
-            ? { value: { build: { version: "4.3.1" } } }
+            ? { value: { build: { version: "4.3.5" } } }
             : url.endsWith("/source")
               ? { value: foreground ? xml : xml.replace(`focused="true"`, `focused="false"`) }
-              : url.endsWith("/element/native-window/screenshot")
-                ? { value: Buffer.from("png").toString("base64") }
+              : JSON.stringify(body ?? null).includes("macos: screenshots")
+                ? { value: { main: { isMain: true, payload: PNG_BYTES.toString("base64") } } }
                 : url.endsWith("/elements")
-                  ? JSON.stringify(body).includes("XCUIElementTypeWindow")
+                  ? !JSON.stringify(body).includes("]//XCUIElementTypeButton")
                     ? { value: [{ "element-6066-11e4-a52e-4f735466cecf": "native-window" }] }
                     : { value: [{ "element-6066-11e4-a52e-4f735466cecf": "native-save" }] }
                   : url.endsWith("/element/native-save/rect")
@@ -287,7 +936,7 @@ describe("Mac2DesktopAdapter", () => {
         evaluate: async (input) => {
           visualCalls += 1;
           if (pendingVisual) return new Promise<never>(() => undefined);
-          expect(new TextDecoder().decode(input.screenshot)).toBe("png");
+          expect(Array.from(input.screenshot.subarray(0, 8))).toEqual(Array.from(PNG_BYTES.subarray(0, 8)));
           return malformedVisual
             ? { status: "passed", reason: "ok", extra: true }
             : { status: "passed", reason: "ok" };
@@ -336,7 +985,7 @@ describe("Mac2DesktopAdapter", () => {
       ...observed.value.observation,
       screenshot: {
         artifactId: "artifact-00000001" as ArtifactId,
-        sha256: createHash("sha256").update("png").digest("hex"),
+        sha256: createHash("sha256").update(PNG_BYTES).digest("hex"),
       },
       uiSnapshot: { artifactId: "artifact-00000002" as ArtifactId, sha256: "b".repeat(64) },
     };
@@ -362,7 +1011,8 @@ describe("Mac2DesktopAdapter", () => {
     );
     expect(cancelledVisual.ok && cancelledVisual.value.status).toBe("unverifiable");
     pendingVisual = false;
-    expect(calls.some((call) => call.url.endsWith("/element/native-window/screenshot"))).toBe(true);
+    expect(calls.some((call) => /\/element\/[^/]+\/screenshot$/u.test(call.url))).toBe(false);
+    expect(calls.some((call) => JSON.stringify(call.body ?? null).includes("macos: screenshots"))).toBe(true);
     const button = observed.value.observation.elements.find((item) => item.identifier === "save");
     if (!button) throw new Error("button missing");
     const ref = {
@@ -398,7 +1048,8 @@ describe("Mac2DesktopAdapter", () => {
     const liveResolution = calls.filter((call) => call.url.endsWith("/elements")).at(-1);
     expect(liveResolution?.body).toEqual({
       using: "xpath",
-      value: ".//XCUIElementTypeButton[@identifier='save' and @title='Save' and @enabled='true']",
+      value:
+        "//XCUIElementTypeWindow[translate(@title, 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz')='main']//XCUIElementTypeButton[@identifier='save' and @title='Save' and @enabled='true']",
     });
     expect(
       adapter
@@ -406,7 +1057,7 @@ describe("Mac2DesktopAdapter", () => {
           ...observed.value.observation,
           screenshot: {
             artifactId: "artifact-00000001" as ArtifactId,
-            sha256: createHash("sha256").update("png").digest("hex"),
+            sha256: createHash("sha256").update(PNG_BYTES).digest("hex"),
           },
           uiSnapshot: { artifactId: "artifact-00000002" as ArtifactId, sha256: "b".repeat(64) },
         })

@@ -13,7 +13,7 @@
     }
   },
   "timeouts": {
-    "runTotalMs": 600000,
+    "runTotalMs": 7200000,
     "imagePullMs": 300000,
     "cloneMs": 120000,
     "vmBootMs": 180000,
@@ -44,11 +44,11 @@
     },
     "readiness": {
       "maxAttempts": 10,
-      "backoffMs": 1000
+      "backoffMs": 3000
     },
     "observation": {
-      "maxAttempts": 2,
-      "backoffMs": 250
+      "maxAttempts": 5,
+      "backoffMs": 1000
     }
   },
   "network": [],
@@ -59,8 +59,8 @@
     "tart": "2.35",
     "appiumMajor": 3,
     "appium": "3.7.0",
-    "mac2": "4.3.1",
-    "wdaSha256": "bad71dfeaaa51d3a7224f022c580cdb7424565ca0c4b7f72ad4b0c2b9a339b62",
+    "mac2": "4.3.5",
+    "wdaSha256": "094e95c782c034d5755a4056e55ae6e98284e9f2339f15b210a1309c4f46b733",
     "guestMacOS": "26.0",
     "xcode": "26.0",
     "fixtureBuild": "1"

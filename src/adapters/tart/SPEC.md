@@ -2,7 +2,7 @@
 
 ## Purpose
 
-Implement ImagePort and VmPort through Tart for immutable OCI Golden Images, one ephemeral managed clone, Host-only networking, live VM inspection, and attribution-safe cleanup.
+Implement ImagePort and VmPort through Tart for immutable OCI Golden Images, one ephemeral managed clone, fixed shared/NAT networking, live VM inspection, and attribution-safe cleanup.
 
 ## Dependencies
 
@@ -19,13 +19,13 @@ Image behavior:
 - Only Tart Registry/OCI sources are supported.
 - An immutable digest is mandatory; mutable-only tags and HTTP downloads are rejected.
 - Missing images may be pulled while the global lock is held and no Run is active. Registry and Tart own transfer-time immutable-digest verification and atomic cache registration.
-- Before allocation the Adapter validates strict Tart inventory and requires the exact configured `reference@sha256` identity. Tart 2.35.x exposes neither cached bytes nor quarantine; this runtime does not claim an independent byte rehash and fails closed instead of deleting, mutating, or silently re-pulling an inconsistent existing cache.
+- Before allocation the Adapter validates strict Tart inventory and requires the exact configured `reference@sha256` identity for the newly published Appium 3.7.0/Mac2 4.3.5 Golden Image. Tart 2.35.x exposes neither cached bytes nor quarantine; this runtime does not claim an independent byte rehash and fails closed instead of deleting, mutating, or silently re-pulling an inconsistent existing cache.
 - Cleanup never removes the shared Golden Image cache.
 
 VM behavior:
 
 - Every formal Run clones the configured Golden Image; the Golden Image itself is never started or modified.
-- V1 starts the clone with Host-only networking and disabled shared clipboard. Bridged networking and public forwarding are unsupported.
+- When the retained GatewayConfig network array is empty, V1 starts the clone with Tart shared/NAT networking and disabled shared clipboard. Outbound Internet access is unrestricted for the early-stage profile. Nonempty rules fail validation; bridged networking and inbound/public forwarding are unsupported.
 - Clone names are generated and validated internally.
 - Stop and destroy are idempotent with respect to an already absent attributable clone.
 - Destruction requires a trustworthy state record linking RunId and clone name. Non-project VMs are ignored.
@@ -40,7 +40,7 @@ Before clone, the managed resource record durably enters `clonePlanned`; provide
 - Exact-digest OCI image identity/cache inspection and fail-closed pull verification.
 - Managed clone name/ownership mapping.
 - VM clone/start/inspect/stop/destroy translations.
-- Host-only/Softnet policy validation.
+- Fixed shared-network and disabled-clipboard launch policy.
 
 ## Architecture
 
@@ -54,7 +54,7 @@ CLI exits and timeouts are classified by operation stage and whether Tart proves
 
 ## Verification Scope
 
-Offline tests cover argument safety, parsing, digest validation, ownership reconciliation, non-project VM preservation, and error classification. Provisioned tests cover pull/cache, clone, Host-only start, inspect, idempotent stop/destroy, timeout/cancel, crash recovery, and failure cleanup.
+Offline tests cover argument safety, exact shared-network/disabled-clipboard arguments, absence of bridge/forward flags, parsing, digest validation, ownership reconciliation, non-project VM preservation, and error classification. Provisioned tests cover pull/cache, clone, Internet-capable shared start, Host control-channel reachability, inspect, idempotent stop/destroy, timeout/cancel, crash recovery, and failure cleanup.
 
 ## Current Invariants
 
@@ -62,6 +62,6 @@ Offline tests cover argument safety, parsing, digest validation, ownership recon
 - Formal Runs never mutate or delete Golden Images.
 - No VM is deleted from name prefix alone.
 
-## Host-only Network Rules
+## Network Profile
 
-V1 NetworkRules constrain only destinations reachable inside the Host-only network. They do not provide Internet access or enable NAT, bridging, public forwarding, or Host-mediated egress. Nonempty rules preserve Tart Host-only mode and constrain Guest traffic by CIDR, port and protocol; the control channel and DHCP remain available. Effective filtering must be verified before business work. Rules never cause automatic network relaxation.
+The Adapter always uses Tart's default shared/NAT network, never passes `--net-host`, `--net-bridged`, Softnet allow/block/expose options, or public forwarding options, and always passes `--no-clipboard`. This profile is static code policy, not caller configuration.

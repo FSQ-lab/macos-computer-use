@@ -7,20 +7,20 @@ Kernel owns all provider-neutral orchestration and policy: global serialization,
 ## Dependencies
 
 - Project: public `contracts` only.
-- Injected: ImagePort, VmPort, GuestPort, DesktopPort, EvidencePort, Clock, IdGenerator, GatewayLock, and configured Hooks.
+- Injected: ImagePort, VmPort, GuestPort, DesktopPort, EvidencePort, Clock, IdGenerator, GatewayLock, and configured Hooks. The retained network array is required to be empty; VmPort starts shared/NAT and GuestPort network configuration remains a no-op.
 - Forbidden: concrete Adapter imports, Tart/Appium/Mac2 types, CLI formatting, direct filesystem/process/network access.
 
 ## Public Interface
 
-Kernel exposes an internal application service consumed only by Client. It accepts validated configuration and Scenario/callback operations, returns neutral OperationResults, logical observations/references, and complete RunResults, and provides recovery/read-only Run operations needed by Client. It does not expose Ports or provider instances.
+Kernel exposes an internal application service consumed only by Client. It accepts validated configuration plus a per-Run ApplicationTarget and Scenario/callback operations, returns neutral OperationResults, logical observations/references, and complete RunResults, and provides recovery/read-only Run operations needed by Client. It does not expose Ports or provider instances.
 
 ## Environment And Run State
 
-Environment lifecycle is `allocating`, `active`, `cleaningUp`, `closed`, or `failed`. Readiness is a separate aggregate of VM, Guest, Driver, and App probes with result time, expiry, duration, and diagnostic reference. Overall ready requires every required probe to be successful and fresh.
+Environment lifecycle is `allocating`, `active`, `cleaningUp`, `closed`, or `failed`. Readiness is a separate aggregate of VM, Guest, Driver, and App probes with result time, expiry, duration, and diagnostic reference. Activation always requires every required probe to be successful and fresh. Configured Scenario/CLI operations continue to require aggregate freshness. A Pi-selected interactive Run instead treats the successful activation snapshot as startup readiness: subsequent operations are bounded by the exclusive Run lease and total deadline, while DesktopPort calls revalidate the live session, frozen application identity, owned window, and foreground state before provider work. An expired startup probe alone does not end a Pi-selected interactive Run.
 
-VM, Guest, session, or AUT reconstruction increments generation and invalidates all prior WindowRefs, Observations, and ElementRefs. Each Run has one exclusive lease. Expired/revoked/mismatched leases reject new operations before dispatch but never suppress finalization or cleanup.
+VM, Guest, session, or selected-application reconstruction increments generation and invalidates all prior WindowRefs, Observations, and ElementRefs. Each Run has one exclusive lease. Expired/revoked/mismatched leases reject new operations before dispatch but never suppress finalization or cleanup.
 
-AUT becomes callable only after App readiness selects one unique target window. Kernel activates AUT once during readiness. Focus loss, system UI, unknown windows, or permission prompts stop new business work; Kernel does not silently reactivate or operate them.
+After VM/Guest readiness, Kernel resolves the Run's ApplicationTarget through GuestPort. Zero or ambiguous matches fail before Appium/session creation. Kernel rejects the fixed protected bundle-ID denylist, freezes the allowed ApplicationDescriptor, and supplies it to DesktopPort. In this incremental version the selected application becomes callable only when readiness finds exactly one application-owned window; zero or multiple windows fail closed. Focus loss, system UI, another application, unknown windows, or permission prompts stop new business work; Kernel does not silently reactivate, switch, or operate them.
 
 ## Global Serialization
 
@@ -38,7 +38,7 @@ run Evidence preflight and commit required before artifacts
 append and fsync ActionPlanned
 dispatch exactly once through DesktopPort
 append validated ProviderReceipt
-capture/commit required after Observation
+wait the configured Observation backoff, then capture/commit required after Observation with bounded safe retries
 evaluate frozen assertions
 derive ActionResult
 append the Step projection events
@@ -46,7 +46,7 @@ append the Step projection events
 
 Any failure before dispatch is `notDispatched`. A crash after durable ActionPlanned and before a reliable receipt leaves dispatch/outcome unknown and retry disposition `reconcileRequired`. Provider success without an independent passing assertion remains unverified. After-capture failure preserves known Provider facts, marks verification unverifiable and Evidence incomplete, stops further Scenario work, and continues bounded finalization.
 
-Every action invalidates ElementRefs for affected windows. Assertions resolve new queries against the after Observation; they never reuse before-action ElementRefs.
+Every action invalidates ElementRefs for affected windows. Assertions resolve new queries against the after Observation; they never reuse before-action ElementRefs. After Provider dispatch, Kernel never retries or reconstructs the action. Action-before and action-after Observation capture use `retry.observation.maxAttempts` and `retry.observation.backoffMs` within one `observeMs` stage deadline and the remaining Run deadline. Retry is limited to safe transient `ProviderFailure`, `ProviderTimeout`, `SessionUnavailable`, and `SnapshotIncomplete` errors; cancellation, application/window ownership failure, or any other error stops immediately. The retry chain retains the earliest safe normalized Provider cause, including a screenshot failure returned alongside a structured capture, and later source/session failures caused by the same degradation cannot replace it in the terminal result or diagnostic Evidence. After initial readiness, if retries exhaust solely because the Mac2 display screenshot failed while a current canonical UI snapshot and ownership facts are available, Kernel commits a structured-only Observation and marks Evidence incomplete. Before dispatch, this path permits only nonvisual actions with a unique live target and passing nonvisual preconditions; any visual precondition prevents dispatch. After dispatch, deterministic nonvisual assertions continue and screenshot diagnostics are preserved. Other exhaustion remains unverifiable and stops business work.
 
 ## Scenario And Verdict
 
@@ -60,7 +60,7 @@ Kernel is the sole Evidence event writer and allocates strictly increasing per-R
 
 ## Timeout, Cancellation, And Retry
 
-Kernel uses injected monotonic time for durations, leases, freshness, backoff, and timeout. Stage budgets cannot exceed the remaining Run budget. Cleanup has an independent reserved budget. AbortSignal requests cancellation but does not prove provider cancellation or rollback.
+Kernel uses injected monotonic time for durations, leases, freshness, backoff, and timeout. Every entry path uses the validated fixed 7,200,000 ms Run budget. Stage budgets cannot exceed the remaining Run budget. Cleanup has an independent fixed 120,000 ms reserved budget. AbortSignal requests cancellation but does not prove provider cancellation or rollback.
 
 Only operations whose normalized retry disposition is `safe` may be retried, under operation-specific max attempts and the original stage budget. V1 never automatically retries Desktop action dispatch. Backoff is cancellable. Adapters do not retry internally.
 
@@ -97,7 +97,7 @@ Expected failures are normalized OperationResults. Kernel preserves distinct dis
 
 ## Verification Scope
 
-Unit tests cover every legal/illegal transition, global lock behavior, readiness freshness, lease/generation invalidation, latest-snapshot enforcement, ActionResult classification, assertion rules, sequence, timeout/cancel/retry, Hook isolation, recovery reconciliation, and cleanup/verdict independence. Semantic Port tests exercise the same Kernel path with Fakes.
+Unit tests cover every legal/illegal transition, application-resolution ordering, protected-application rejection before session creation, descriptor freezing, application-switch rejection, global lock behavior, configured-Run readiness freshness, Pi-selected interaction beyond initial probe expiry, lease/generation invalidation, latest-snapshot enforcement, ActionResult classification, assertion rules, post-dispatch settle/retry without action replay, earliest safe retry-cause preservation, sequence, timeout/cancel/retry, Hook isolation, recovery reconciliation, and cleanup/verdict independence. Semantic Port tests exercise the same Kernel path with Fakes.
 
 ## Current Invariants
 
@@ -105,3 +105,4 @@ Unit tests cover every legal/illegal transition, global lock behavior, readiness
 - Kernel never guesses missing dispatch or execution facts.
 - No second operation overlaps an active lifecycle/observe/action/assertion operation.
 - Recovery and cleanup remain active after ordinary cancellation.
+- A Run has exactly one Kernel-frozen ApplicationDescriptor and cannot change application identity after resolution.

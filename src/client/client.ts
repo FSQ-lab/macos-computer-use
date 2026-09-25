@@ -1,10 +1,11 @@
 import { access, lstat, readFile, stat } from "node:fs/promises";
 import { execFile, execFileSync } from "node:child_process";
-import { constants, statSync } from "node:fs";
+import { constants } from "node:fs";
 import { join } from "node:path";
 import { promisify } from "node:util";
 import {
   AssertionSpecSchema,
+  ApplicationTargetSchema,
   HookDescriptorSchema,
   DesktopActionSchema,
   ElementIdSchema,
@@ -15,6 +16,7 @@ import {
   err,
   ok,
   type AssertionSpec,
+  type ApplicationTarget,
   type OperationResult,
   type Scenario,
 } from "../contracts/index.js";
@@ -64,10 +66,18 @@ export interface MacOSComputerUseClient {
   listRetentionFailures(): Promise<OperationResult<readonly RunId[]>>;
 }
 
+export interface PiMacOSComputerUseClient extends MacOSComputerUseClient {
+  runForApplication<T>(
+    application: ApplicationTarget,
+    options: { finalAssertions: readonly AssertionSpec[]; signal?: AbortSignal },
+    callback: (run: ClientRun) => Promise<T>,
+  ): Promise<OperationResult<{ runId: RunId; result: RunResult; value?: T }>>;
+}
+
 export const buildMacOSComputerUseClientForTesting = (
   input: unknown,
   options?: { visualEvaluator?: VisualEvaluator; hooks?: readonly HookDescriptor[] },
-): MacOSComputerUseClient => {
+): PiMacOSComputerUseClient => {
   const config = GatewayConfigSchema.parse(input);
   const hooks = (options?.hooks ?? []).map((hook) => new WorkerEventHook(HookDescriptorSchema.parse(hook)));
   if (new Set(hooks.map((hook) => hook.name)).size !== hooks.length) throw new Error("Duplicate Hook names");
@@ -83,22 +93,12 @@ export const buildMacOSComputerUseClientForTesting = (
       return "unavailable";
     }
   })();
-  const softnetReady = (() => {
-    try {
-      const info = statSync("/opt/homebrew/bin/softnet");
-      return info.isFile() && info.uid === 0 && (info.mode & 0o4000) !== 0;
-    } catch {
-      return false;
-    }
-  })();
   const compatibilityError =
     !process.versions.node.startsWith("24.") || process.platform !== "darwin" || process.arch !== "arm64"
       ? "Unsupported Host runtime."
       : !/^2\.35\.\d+$/.test(tartVersion)
         ? "Unsupported Tart version."
-        : !softnetReady
-          ? "Tart Softnet is not prepared with its required SUID permission. Run Tart once and complete the operator-approved sudo setup."
-          : undefined;
+        : undefined;
   const sensitive = new MemorySensitiveDataPolicy();
   const ids = new SecureIdGenerator();
   const appEnvironment: Record<string, string> = {};
@@ -127,6 +127,7 @@ export const buildMacOSComputerUseClientForTesting = (
   const guest = {
     probe: guestAdapter.probe.bind(guestAdapter),
     configureNetwork: guestAdapter.configureNetwork.bind(guestAdapter),
+    resolveApplication: guestAdapter.resolveApplication.bind(guestAdapter),
     startAppium: guestAdapter.startAppium.bind(guestAdapter),
     stopAppium: async (...args: Parameters<TartExecGuestAdapter["stopAppium"]>) => {
       const result = await guestAdapter.stopAppium(...args);
@@ -169,97 +170,123 @@ export const buildMacOSComputerUseClientForTesting = (
     buildVersion: "0.1.0",
     hooks,
   });
+  const runInteractive = async <T>(
+    options: { finalAssertions: readonly AssertionSpec[]; signal?: AbortSignal },
+    callback: (run: ClientRun) => Promise<T>,
+    applicationInput?: ApplicationTarget,
+  ): Promise<OperationResult<{ runId: RunId; result: RunResult; value?: T }>> => {
+    if (compatibilityError)
+      return err({
+        code: "UnsupportedRuntime",
+        phase: "vm",
+        message: compatibilityError,
+        retryDisposition: "notApplicable",
+      });
+    const parsed = options.finalAssertions.map((item) => AssertionSpecSchema.safeParse(item));
+    if (parsed.length === 0 || parsed.some((item) => !item.success))
+      return err({
+        code: "InvalidScenario",
+        phase: "action",
+        message: "At least one valid final assertion is required.",
+        retryDisposition: "notApplicable",
+      });
+    const assertions = parsed.flatMap((item) => (item.success ? [item.data] : []));
+    const application = applicationInput ? ApplicationTargetSchema.safeParse(applicationInput) : undefined;
+    if (application && !application.success)
+      return err({
+        code: "InvalidScenario",
+        phase: "guest",
+        message: "Application target is invalid.",
+        retryDisposition: "notApplicable",
+      });
+    return gateway.executeInteractive(
+      config,
+      assertions,
+      async (run) =>
+        callback({
+          leaseId: run.leaseId,
+          observe: () => run.observe(),
+          assert: async (assertion) => {
+            const parsed = AssertionSpecSchema.safeParse(assertion);
+            return parsed.success
+              ? run.assert(parsed.data)
+              : err({
+                  code: "InvalidScenario",
+                  phase: "observe",
+                  message: "Assertion is invalid.",
+                  retryDisposition: "safe",
+                });
+          },
+          assertCurrent: async (assertion) => {
+            const parsed = AssertionSpecSchema.safeParse(assertion);
+            return parsed.success
+              ? run.assertCurrent(parsed.data)
+              : err({
+                  code: "InvalidScenario",
+                  phase: "observe",
+                  message: "Assertion is invalid.",
+                  retryDisposition: "safe",
+                });
+          },
+          compact: () => run.compact(),
+          queryPage: (query, options) => {
+            const parsed = ElementQuerySchema.safeParse(query);
+            return parsed.success
+              ? run.queryPage(parsed.data, options)
+              : err({
+                  code: "InvalidScenario",
+                  phase: "observe",
+                  message: "Query is invalid.",
+                  retryDisposition: "safe",
+                });
+          },
+          query: (query) => {
+            const parsed = ElementQuerySchema.safeParse(query);
+            return parsed.success
+              ? run.query(parsed.data)
+              : err({
+                  code: "InvalidScenario",
+                  phase: "observe",
+                  message: "Element query is invalid.",
+                  retryDisposition: "safe",
+                });
+          },
+          expand: (elementId) => {
+            const parsed = ElementIdSchema.safeParse(elementId);
+            return parsed.success
+              ? run.expand(parsed.data)
+              : err({
+                  code: "InvalidScenario",
+                  phase: "observe",
+                  message: "Element ID is invalid.",
+                  retryDisposition: "safe",
+                });
+          },
+          action: (action, actionAssertions = []) => {
+            const parsedAction = DesktopActionSchema.safeParse(action);
+            const parsedAssertions = actionAssertions.map((item) => AssertionSpecSchema.safeParse(item));
+            const validAssertions = parsedAssertions.flatMap((item) => (item.success ? [item.data] : []));
+            return parsedAction.success && parsedAssertions.every((item) => item.success)
+              ? run.action(parsedAction.data, validAssertions)
+              : Promise.resolve(
+                  err({
+                    code: "InvalidScenario",
+                    phase: "action",
+                    message: "Interactive action or assertion is invalid.",
+                    retryDisposition: "safe",
+                    dispatch: "notDispatched",
+                  }),
+                );
+          },
+        }),
+      options.signal ?? new AbortController().signal,
+      appEnvironment,
+      application?.data,
+    );
+  };
   return {
-    run: async (options, callback) => {
-      if (compatibilityError)
-        return err({
-          code: "UnsupportedRuntime",
-          phase: "vm",
-          message: compatibilityError,
-          retryDisposition: "notApplicable",
-        });
-      const parsed = options.finalAssertions.map((item) => AssertionSpecSchema.safeParse(item));
-      if (parsed.length === 0 || parsed.some((item) => !item.success))
-        return err({
-          code: "InvalidScenario",
-          phase: "action",
-          message: "At least one valid final assertion is required.",
-          retryDisposition: "notApplicable",
-        });
-      const assertions = parsed.flatMap((item) => (item.success ? [item.data] : []));
-      return gateway.executeInteractive(
-        config,
-        assertions,
-        async (run) =>
-          callback({
-            leaseId: run.leaseId,
-            observe: () => run.observe(),
-            assert: async (assertion) => {
-              const parsed = AssertionSpecSchema.safeParse(assertion);
-              return parsed.success
-                ? run.assert(parsed.data)
-                : err({
-                    code: "InvalidScenario",
-                    phase: "observe",
-                    message: "Assertion is invalid.",
-                    retryDisposition: "safe",
-                  });
-            },
-            compact: () => run.compact(),
-            queryPage: (query, options) => {
-              const parsed = ElementQuerySchema.safeParse(query);
-              return parsed.success
-                ? run.queryPage(parsed.data, options)
-                : err({
-                    code: "InvalidScenario",
-                    phase: "observe",
-                    message: "Query is invalid.",
-                    retryDisposition: "safe",
-                  });
-            },
-            query: (query) => {
-              const parsed = ElementQuerySchema.safeParse(query);
-              return parsed.success
-                ? run.query(parsed.data)
-                : err({
-                    code: "InvalidScenario",
-                    phase: "observe",
-                    message: "Element query is invalid.",
-                    retryDisposition: "safe",
-                  });
-            },
-            expand: (elementId) => {
-              const parsed = ElementIdSchema.safeParse(elementId);
-              return parsed.success
-                ? run.expand(parsed.data)
-                : err({
-                    code: "InvalidScenario",
-                    phase: "observe",
-                    message: "Element ID is invalid.",
-                    retryDisposition: "safe",
-                  });
-            },
-            action: (action, actionAssertions = []) => {
-              const parsedAction = DesktopActionSchema.safeParse(action);
-              const parsedAssertions = actionAssertions.map((item) => AssertionSpecSchema.safeParse(item));
-              const validAssertions = parsedAssertions.flatMap((item) => (item.success ? [item.data] : []));
-              return parsedAction.success && parsedAssertions.every((item) => item.success)
-                ? run.action(parsedAction.data, validAssertions)
-                : Promise.resolve(
-                    err({
-                      code: "InvalidScenario",
-                      phase: "action",
-                      message: "Interactive action or assertion is invalid.",
-                      retryDisposition: "safe",
-                      dispatch: "notDispatched",
-                    }),
-                  );
-            },
-          }),
-        options.signal ?? new AbortController().signal,
-        appEnvironment,
-      );
-    },
+    run: (options, callback) => runInteractive(options, callback),
+    runForApplication: (application, options, callback) => runInteractive(options, callback, application),
     runScenario: async (scenarioInput, options) => {
       if (compatibilityError)
         return err({
@@ -323,13 +350,6 @@ export const buildMacOSComputerUseClientForTesting = (
           name: "tart",
           status: /^2\.35\.\d+$/.test(tartVersion) ? "passed" : "failed",
           detail: tartVersion,
-        },
-        {
-          name: "softnet-suid",
-          status: softnetReady ? "passed" : "failed",
-          detail: softnetReady
-            ? "Softnet SUID permission is ready."
-            : "Run Tart once and complete its operator-approved sudo setup.",
         },
       ];
       for (const [name, path] of [
@@ -480,3 +500,16 @@ export const createMacOSComputerUseClient = (
   }
 };
 export const tryCreateMacOSComputerUseClient = createMacOSComputerUseClient;
+
+export const createPiMacOSComputerUseClient = (input: unknown): OperationResult<PiMacOSComputerUseClient> => {
+  try {
+    return ok(buildMacOSComputerUseClientForTesting(input));
+  } catch {
+    return err({
+      code: "InvalidConfiguration",
+      phase: "vm",
+      message: "Configuration or Host compatibility is invalid.",
+      retryDisposition: "notApplicable",
+    });
+  }
+};

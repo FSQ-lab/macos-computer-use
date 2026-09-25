@@ -1,1 +1,5 @@
-export { TartExecGuestAdapter } from "./tart-exec-guest.js";
+export {
+  TartExecGuestAdapter,
+  parseApplicationInventoryPaths,
+  parseApplicationMetadata,
+} from "./tart-exec-guest.js";
