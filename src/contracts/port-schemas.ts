@@ -68,7 +68,30 @@ export const ArtifactCommitRequestSchema = z
     sensitivity: z.enum(["normal", "potentiallySensitive"]),
     bytes: z.custom<Uint8Array>((value) => value instanceof Uint8Array),
   })
-  .strict();
+  .strict()
+  .superRefine((request, context) => {
+    const fixed: Readonly<Record<string, string>> = {
+      "effective-config": "application/json",
+      environment: "application/json",
+      "guest-diagnostics": "application/json",
+      "ui-snapshot": "application/json",
+      "display-screenshot": "image/png",
+      "window-screenshot": "image/png",
+    };
+    const expected = fixed[request.type];
+    const hook = /^hook-[A-Za-z0-9][A-Za-z0-9_-]{0,31}-[A-Za-z0-9._-]{1,32}$/.test(request.type);
+    if (expected === undefined && !hook)
+      context.addIssue({ code: "custom", path: ["type"], message: "Unsupported Artifact type." });
+    if (
+      (expected !== undefined && request.mimeType !== expected) ||
+      (hook && request.mimeType !== "application/octet-stream")
+    )
+      context.addIssue({
+        code: "custom",
+        path: ["mimeType"],
+        message: "Artifact MIME does not match its type.",
+      });
+  });
 
 export type ImageRequest = z.infer<typeof ImageRequestSchema>;
 export type CloneRequest = z.infer<typeof CloneRequestSchema>;

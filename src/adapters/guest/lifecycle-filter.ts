@@ -1,0 +1,25 @@
+const lines = [
+  "BEGIN { sequence = 0; outerCount = 0; innerCount = 0; awaitingInner = 0 }",
+  'function timestamp(  command, value) { command = "/bin/date -u +%Y-%m-%dT%H:%M:%SZ"; command | getline value; close(command); return value }',
+  'function uuid(line,  found) { found = match(line, /[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}/); return found ? substr(line, RSTART, RLENGTH) : "" }',
+  "function emit(source, event, alias, cause, exitCode, signal,  value) {",
+  "  sequence += 1",
+  '  value = "{\\"sequence\\":" sequence ",\\"recordedAt\\":\\"" timestamp() "\\",\\"source\\":\\"" source "\\",\\"event\\":\\"" event "\\""',
+  '  if (alias != "") value = value ",\\"alias\\":\\"" alias "\\""',
+  '  if (cause != "") value = value ",\\"cause\\":\\"" cause "\\""',
+  '  if (exitCode != "") value = value ",\\"exitCode\\":" exitCode',
+  '  if (signal != "") value = value ",\\"signal\\":\\"" signal "\\""',
+  '  print value ",\\"observedBeforeCleanup\\":true}"',
+  "  fflush()",
+  "}",
+  '/Session created with session id:/ { id = uuid($0); if (id != "" && !(id in outer)) { outerCount += 1; outer[id] = "outer-" outerCount; emit("appium", "sessionCreated", outer[id], "", "", "") }; next }',
+  "/Proxying \\[POST \\/session\\]/ { awaitingInner = 1; next }",
+  'awaitingInner && /Got response with status 200:/ { id = uuid($0); awaitingInner = 0; if (id != "") { if (activeInner != "" && activeInner != id) emit("wda", "sessionReplaced", inner[activeInner], "replacement", "", ""); if (!(id in inner)) { innerCount += 1; inner[id] = "inner-" innerCount; emit("wda", "sessionCreated", inner[id], "", "", "") }; activeInner = id }; next }',
+  '/Calling AppiumDriver.deleteSession/ { id = uuid($0); if (id in outer) emit("appium", "sessionDeleteRequested", outer[id], "explicitDelete", "", ""); next }',
+  '/Proxying \\[DELETE \\/session\\// { id = uuid($0); if (id in inner) { emit("wda", "sessionDeleteRequested", inner[id], "explicitDelete", "", ""); if (activeInner == id) activeInner = "" }; next }',
+  '/Removing session .* from our master session list/ { id = uuid($0); if (id in outer) emit("appium", "sessionRemoved", outer[id], "unknown", "", ""); next }',
+  '/Ending session, cause was/ { cause = index($0, "New Command Timeout") ? "newCommandTimeout" : "unexpectedShutdown"; emit("appium", "unexpectedShutdown", "", cause, "", ""); next }',
+  '/Mac2Driver host process has exited with code/ { exitCode = ""; signal = ""; if (match($0, /code [0-9]+/)) exitCode = substr($0, RSTART + 5, RLENGTH - 5); if (match($0, /signal SIG[A-Z]+/)) signal = substr($0, RSTART + 7, RLENGTH - 7); emit("xcodebuild", "processExited", "", "providerExit", exitCode, signal); next }',
+] as const;
+
+export const appiumLifecycleFilterProgram = lines.join("\n");

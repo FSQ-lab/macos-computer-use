@@ -118,6 +118,45 @@ describe("Mac2DesktopAdapter", () => {
     });
     expect(adapter.compact(observation)).toContain("  [");
     expect(adapter.compact(observation)).toContain("parent=element-");
+    expect(
+      adapter.preflightAssertion(
+        { kind: "state", query: { role: "checkbox" }, state: { focused: true } },
+        observation,
+      ),
+    ).toMatchObject({ ok: true, value: { status: "unverifiable" } });
+    expect(
+      adapter.preflightAssertion(
+        {
+          kind: "value",
+          query: { role: "group", value: { exact: "Future" }, descendant: { role: "checkbox" } },
+          expected: "Future",
+          match: "exact",
+        },
+        observation,
+      ),
+    ).toMatchObject({ ok: true, value: { status: "admissible" } });
+    const duplicateText = {
+      ...observation,
+      elements: [
+        ...observation.elements,
+        {
+          elementId: "element-duplicate-00000001" as never,
+          role: "statictext",
+          value: "Second task",
+        },
+        {
+          elementId: "element-duplicate-00000002" as never,
+          role: "statictext",
+          value: "Second task",
+        },
+      ],
+    };
+    expect(
+      adapter.preflightAssertion(
+        { kind: "visible", query: { role: "statictext", value: { exact: "Second task" } } },
+        duplicateText,
+      ),
+    ).toMatchObject({ ok: true, value: { status: "unverifiable" } });
   });
   it.each([
     ["1", "false", true],

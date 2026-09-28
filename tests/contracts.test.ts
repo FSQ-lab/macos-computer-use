@@ -7,6 +7,7 @@ import {
   EvidenceEventSchema,
   CurrentEvidenceEventSchema,
   GatewayConfigSchema,
+  ProviderLifecycleDiagnosticSchema,
   RelativePointSchema,
   ScenarioSchema,
   TextInputSchema,
@@ -23,6 +24,62 @@ const ref = {
 };
 
 describe("contracts", () => {
+  it("validates lifecycle diagnostics without raw provider fields", () => {
+    const diagnostic = {
+      schemaVersion: 1,
+      compatibility: { appium: "3.7.0", mac2: "4.3.5" },
+      events: [
+        {
+          sequence: 1,
+          recordedAt: "2026-09-26T00:00:00.000Z",
+          source: "appium",
+          event: "sessionCreated",
+          alias: "outer-1",
+          observedBeforeCleanup: true,
+        },
+        {
+          sequence: 2,
+          recordedAt: "2026-09-26T00:00:01.000Z",
+          source: "appium",
+          event: "unexpectedShutdown",
+          cause: "newCommandTimeout",
+          observedBeforeCleanup: true,
+        },
+      ],
+      snapshot: {
+        capturedAt: "2026-09-26T00:00:02.000Z",
+        observedBeforeCleanup: true,
+        appiumStatus: "ready",
+        wdaStatus: "ready",
+        activeSessionCount: 0,
+        processes: { appium: true, xcodebuild: true, wda: true },
+      },
+      earliestTermination: {
+        sequence: 2,
+        source: "appium",
+        event: "unexpectedShutdown",
+        cause: "newCommandTimeout",
+      },
+    };
+    expect(ProviderLifecycleDiagnosticSchema.parse(diagnostic)).toEqual(diagnostic);
+    expect(
+      ProviderLifecycleDiagnosticSchema.safeParse({ ...diagnostic, requestBody: "secret" }).success,
+    ).toBe(false);
+    expect(
+      ProviderLifecycleDiagnosticSchema.safeParse({
+        ...diagnostic,
+        events: [{ ...diagnostic.events[0], alias: "11111111-2222-4333-8444-555555555555" }],
+        earliestTermination: undefined,
+      }).success,
+    ).toBe(false);
+    expect(
+      ProviderLifecycleDiagnosticSchema.safeParse({
+        ...diagnostic,
+        earliestTermination: { ...diagnostic.earliestTermination, sequence: 1 },
+      }).success,
+    ).toBe(false);
+  });
+
   it("accepts display names while rejecting bundle IDs, paths, and patterns", () => {
     expect(ApplicationTargetSchema.parse({ name: "  Safari  " })).toEqual({ name: "Safari" });
     expect(ApplicationTargetSchema.parse({ name: "Acme.App 2" })).toEqual({ name: "Acme.App 2" });

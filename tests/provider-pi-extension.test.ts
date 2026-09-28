@@ -4,7 +4,11 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
 import { describe, expect, it } from "vitest";
-import { createMacOSComputerUseClient, GatewayConfigSchema } from "../src/index.js";
+import {
+  createMacOSComputerUseClient,
+  GatewayConfigSchema,
+  ProviderLifecycleDiagnosticSchema,
+} from "../src/index.js";
 import { PiTaskSupervisor } from "../src/pi-extension/runtime/index.js";
 import { createPiExtension } from "../src/pi-extension/index.js";
 import type { ExtensionAPI, ToolContext, ToolDefinition } from "../src/pi-extension/pi-types.js";
@@ -401,6 +405,22 @@ describe.skipIf(!configPath || profile !== "pi-safari-input")("Pi Safari TodoMVC
         if (!inputReady) await new Promise<void>((resolve) => setTimeout(resolve, 1_000));
       }
       expect(inputReady).toBe(true);
+      const rejectedFreeze = await freeze.execute(
+        "reject-unreliable-freeze",
+        {
+          assertions: [
+            { kind: "visible", query: { role: "statictext", value: { exact: "Publish v0.1.0" } } },
+            { kind: "state", query: { role: "link", name: { exact: "Active" } }, state: { focused: true } },
+          ],
+        },
+        undefined,
+        undefined,
+        context,
+      );
+      expect(rejectedFreeze.details).toMatchObject({
+        kind: "error",
+        error: { code: "ClientFailure", clientCode: "InvalidScenario" },
+      });
       await freeze.execute(
         "freeze",
         {
@@ -533,12 +553,32 @@ describe.skipIf(!configPath || profile !== "pi-safari-input")("Pi Safari TodoMVC
       if (!runId) throw new Error("Safari UAT run is unavailable.");
       const manifest = JSON.parse(
         await readFile(join(config.evidence.root, "runs", runId, "manifest.v1.json"), "utf8"),
-      ) as { artifacts?: { type?: unknown }[] };
+      ) as { artifacts?: { type?: unknown; relativePath?: unknown }[] };
       const screenshotTypes = (manifest.artifacts ?? [])
         .map((artifact) => artifact.type)
         .filter((type): type is string => typeof type === "string" && type.includes("screenshot"));
       expect(screenshotTypes.length).toBeGreaterThan(0);
       expect(new Set(screenshotTypes)).toEqual(new Set(["display-screenshot"]));
+      const diagnostic = (manifest.artifacts ?? []).find(
+        (artifact) => artifact.type === "guest-diagnostics" && typeof artifact.relativePath === "string",
+      );
+      if (!diagnostic || typeof diagnostic.relativePath !== "string")
+        throw new Error("Lifecycle diagnostic missing.");
+      const lifecycleBytes = await readFile(
+        join(config.evidence.root, "runs", runId, diagnostic.relativePath),
+      );
+      const lifecycle = ProviderLifecycleDiagnosticSchema.parse(
+        JSON.parse(lifecycleBytes.toString("utf8")) as unknown,
+      );
+      expect(lifecycle.earliestTermination).toBeUndefined();
+      expect(lifecycle.snapshot).toMatchObject({
+        observedBeforeCleanup: true,
+        appiumStatus: "ready",
+        wdaStatus: "ready",
+        activeSessionCount: 1,
+        processes: { appium: true, xcodebuild: true, wda: true },
+      });
+      expect(lifecycleBytes.toString("utf8")).not.toMatch(/[0-9a-f]{8}-[0-9a-f-]{27,}/iu);
       expect(await managed()).toEqual([]);
       completed = true;
     } finally {

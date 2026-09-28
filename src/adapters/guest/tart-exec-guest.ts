@@ -1,5 +1,4 @@
 import { z } from "zod";
-import { createHash } from "node:crypto";
 import {
   ApplicationDescriptorSchema,
   ApplicationTargetSchema,
@@ -19,8 +18,12 @@ import {
   CompatibilityProbeSchema,
   type IdGenerator,
   AppiumStartResultSchema,
+  ProviderLifecycleDiagnosticSchema,
+  ProviderLifecycleEventSchema,
+  ProviderTerminationEventTypeSchema,
 } from "../../contracts/index.js";
 import { runProcess } from "./process-runner.js";
+import { appiumLifecycleFilterProgram } from "./lifecycle-filter.js";
 
 const receipt = (operationId: OperationId, startedAt: string): ProviderReceipt =>
   ProviderReceiptSchema.parse({
@@ -332,7 +335,7 @@ export class TartExecGuestAdapter implements GuestPort {
         this.#nativeName(cloneName),
         "/bin/zsh",
         "-lc",
-        `set -e; umask 077; mkdir -p ${guestRoot}; if [ -f ${guestRoot}/appium.pid ]; then pid=$(cat ${guestRoot}/appium.pid); case $pid in (""|*[!0-9]*) exit 22;; esac; if kill -0 $pid 2>/dev/null; then exit 0; fi; fi; printf '%s\n' 'Raw driver logging disabled to protect SecretRef values.' > ${guestRoot}/appium.log; printf '%s\n' 'No standalone WDA log is emitted by the Mac2 provider.' > ${guestRoot}/wda.log; /usr/bin/sw_vers > ${guestRoot}/guest.log; (ulimit -f 20480; exec nohup appium --address 0.0.0.0 --port 4723 --log-no-colors --log-level error) > /dev/null 2>&1 < /dev/null & echo $! > ${guestRoot}/appium.pid`,
+        `set -e; umask 077; mkdir -p ${guestRoot}; if [ -f ${guestRoot}/appium.pid ]; then pid=$(cat ${guestRoot}/appium.pid); case $pid in (""|*[!0-9]*) exit 22;; esac; if kill -0 $pid 2>/dev/null; then exit 0; fi; fi; : > ${guestRoot}/lifecycle.jsonl; rm -f ${guestRoot}/appium.pipe; mkfifo -m 600 ${guestRoot}/appium.pipe; nohup /usr/bin/awk '${appiumLifecycleFilterProgram}' < ${guestRoot}/appium.pipe >> ${guestRoot}/lifecycle.jsonl 2>/dev/null & echo $! > ${guestRoot}/filter.pid; (ulimit -f 20480; exec nohup appium --address 0.0.0.0 --port 4723 --log-no-colors --log-level debug) > ${guestRoot}/appium.pipe 2>&1 < /dev/null & echo $! > ${guestRoot}/appium.pid`,
       ],
       signal,
     );
@@ -410,77 +413,139 @@ export class TartExecGuestAdapter implements GuestPort {
     limits: { maxFileBytes: number; maxTotalBytes: number },
     signal: AbortSignal,
   ): Promise<OperationResult<Uint8Array>> {
-    const root = `/tmp/macos-computer-use/${cloneName}`;
-    const records: { path: string; data: string; sha256: string; size: number }[] = [];
-    let totalBytes = 0;
-    for (const name of ["appium.log", "wda.log", "guest.log"]) {
-      const command = `set -e; zmodload zsh/system; [ ! -L /tmp/macos-computer-use ] && [ ! -L ${root} ] || exit 22; [ -e ${root}/${name} ] || exit 25; sysopen -r -o nofollow -u diagnostic_fd -- ${root}/${name} || exit 22; metadata=$(stat -f '%HT %z' /dev/fd/$diagnostic_fd) || exit 22; type=\${metadata% *}; size=\${metadata##* }; [ "$type" = "Regular File" ] || exit 22; [ $size -le ${String(limits.maxFileBytes)} ] || exit 21; base64 <&$diagnostic_fd | tr -d '\n'`;
-      const result = await runProcess(
+    return this.#exportLifecycleDiagnostics(cloneName, limits, signal);
+  }
+
+  async #exportLifecycleDiagnostics(
+    cloneName: string,
+    limits: { maxFileBytes: number; maxTotalBytes: number },
+    signal: AbortSignal,
+  ): Promise<OperationResult<Uint8Array>> {
+    try {
+      const root = `/tmp/macos-computer-use/${cloneName}`;
+      const command = `set -e; zmodload zsh/system; [ ! -L /tmp/macos-computer-use ] && [ ! -L ${root} ] || exit 22; [ -e ${root}/lifecycle.jsonl ] || exit 25; sysopen -r -o nofollow -u diagnostic_fd -- ${root}/lifecycle.jsonl || exit 22; metadata=$(stat -f '%HT %z' /dev/fd/$diagnostic_fd) || exit 22; type=\${metadata% *}; size=\${metadata##* }; [ "$type" = "Regular File" ] || exit 22; [ $size -le ${String(limits.maxFileBytes)} ] || exit 21; base64 <&$diagnostic_fd | tr -d '\n'`;
+      const journal = await runProcess(
         this.tart,
         ["exec", this.#nativeName(cloneName), "/bin/zsh", "-lc", command],
         signal,
-        14_000_000,
+        Math.min(14_000_000, limits.maxFileBytes * 2),
       );
-      if (result.code !== 0)
-        return err({
-          code: "EvidenceIncomplete",
-          phase: "evidence",
-          message: "Guest diagnostic validation failed.",
-          retryDisposition: "notApplicable",
-        });
-      const data = result.stdout.trim();
-      if (data) {
-        const bytes = Buffer.from(data, "base64");
-        if (bytes.byteLength > limits.maxFileBytes || bytes.toString("base64") !== data)
-          return err({
-            code: "EvidenceIncomplete",
-            phase: "evidence",
-            message: "Guest diagnostic encoding or size is invalid.",
-            retryDisposition: "notApplicable",
-          });
-        totalBytes += bytes.byteLength;
-        if (totalBytes > limits.maxTotalBytes)
-          return err({
-            code: "EvidenceIncomplete",
-            phase: "evidence",
-            message: "Guest diagnostics exceed the aggregate limit.",
-            retryDisposition: "notApplicable",
-          });
-        let decoded: string;
-        try {
-          decoded = new TextDecoder("utf-8", { fatal: true }).decode(bytes);
-        } catch {
-          return err({
-            code: "EvidenceIncomplete",
-            phase: "evidence",
-            message: "Guest diagnostic is not valid UTF-8 text.",
-            retryDisposition: "notApplicable",
-          });
-        }
-        const sanitized = (this.sensitive?.sanitizeText(decoded) ?? decoded).replace(
-          /((?:token|api[_-]?key|authorization|cookie|secret|password)\s*[:=]\s*)[^\s]+/gi,
-          "$1[REDACTED]",
+      if (journal.code !== 0) throw new Error("journal");
+      const encoded = journal.stdout.trim();
+      const journalBytes = Buffer.from(encoded, "base64");
+      if (journalBytes.byteLength > limits.maxFileBytes || journalBytes.toString("base64") !== encoded)
+        throw new Error("encoding");
+      const events = new TextDecoder("utf-8", { fatal: true })
+        .decode(journalBytes)
+        .split("\n")
+        .filter(Boolean)
+        .map((line) => ProviderLifecycleEventSchema.parse(JSON.parse(line) as unknown));
+      const ip = await runProcess(
+        this.tart,
+        ["ip", this.#nativeName(cloneName), "--resolver", "agent", "--wait", "30"],
+        signal,
+        4096,
+      );
+      const address = ip.stdout.trim();
+      if (ip.code !== 0 || !/^[0-9a-f:.]+$/i.test(address)) throw new Error("address");
+      const endpoint = `http://${address.includes(":") ? `[${address}]` : address}:4723`;
+      const status = await fetch(`${endpoint}/status`, { signal })
+        .then(async (response) => ({ response, value: await response.json() }))
+        .catch(() => undefined);
+      const sessionsResponse = await fetch(`${endpoint}/appium/sessions`, { signal })
+        .then(async (response) => ({ response, value: await response.json() }))
+        .catch(() => undefined);
+      const ready = z.object({ value: z.object({ ready: z.literal(true) }).loose() }).loose();
+      const sessions = z
+        .object({ value: z.array(z.unknown()).max(16) })
+        .loose()
+        .safeParse(sessionsResponse?.value);
+      const state = await runProcess(
+        this.tart,
+        [
+          "exec",
+          this.#nativeName(cloneName),
+          "/bin/zsh",
+          "-lc",
+          "appium=0; xcodebuild=0; wda=0; pgrep -f 'appium.*--port 4723' >/dev/null && appium=1; pgrep -x xcodebuild >/dev/null && xcodebuild=1; pgrep -x WebDriverAgentRunner-Runner >/dev/null && wda=1; wda_status=unavailable; curl -fsS http://127.0.0.1:10100/status >/dev/null 2>&1 && wda_status=ready; printf '%s %s %s %s\\n' $appium $xcodebuild $wda $wda_status",
+        ],
+        signal,
+        4096,
+      );
+      const stateMatch = /^(0|1) (0|1) (0|1) (ready|unavailable)\n?$/.exec(state.stdout);
+      if (state.code !== 0 || !stateMatch) throw new Error("state");
+      const recordedAt = new Date().toISOString();
+      const appendExit = (source: "appium" | "xcodebuild" | "wda"): void => {
+        events.push(
+          ProviderLifecycleEventSchema.parse({
+            sequence: events.length + 1,
+            recordedAt,
+            source,
+            event: "processExited",
+            cause: "providerExit",
+            observedBeforeCleanup: true,
+          }),
         );
-        if (
-          /(?:token|api[_-]?key|authorization|cookie|secret|password)\s*[:=]\s*(?!\[REDACTED\])[^\s]+/i.test(
-            sanitized,
-          )
-        )
-          return err({
-            code: "EvidenceIncomplete",
-            phase: "evidence",
-            message: "Guest diagnostic sanitization could not be proven complete.",
-            retryDisposition: "notApplicable",
-          });
-        const sanitizedBytes = Buffer.from(sanitized);
-        records.push({
-          path: name,
-          data: sanitizedBytes.toString("base64"),
-          sha256: createHash("sha256").update(sanitizedBytes).digest("hex"),
-          size: sanitizedBytes.byteLength,
-        });
-      }
+      };
+      if (events.some((event) => event.source === "appium") && stateMatch[1] !== "1") appendExit("appium");
+      if (events.some((event) => event.source === "wda") && stateMatch[2] !== "1") appendExit("xcodebuild");
+      if (events.some((event) => event.source === "wda") && stateMatch[3] !== "1") appendExit("wda");
+      const knownOuterSessions = new Set(
+        events.flatMap((event) =>
+          event.event === "sessionCreated" && event.source === "appium" ? [event.alias] : [],
+        ),
+      );
+      for (const event of events)
+        if (event.event === "sessionRemoved" && event.source === "appium")
+          knownOuterSessions.delete(event.alias);
+      const activeSessionCount = sessions.success
+        ? sessions.data.value.length
+        : stateMatch[1] === "1"
+          ? knownOuterSessions.size
+          : 0;
+      const terminal = events.find(
+        (event) => ProviderTerminationEventTypeSchema.safeParse(event.event).success,
+      );
+      const diagnostic = ProviderLifecycleDiagnosticSchema.parse({
+        schemaVersion: 1,
+        compatibility: { appium: "3.7.0", mac2: "4.3.5" },
+        events,
+        snapshot: {
+          capturedAt: new Date().toISOString(),
+          observedBeforeCleanup: true,
+          appiumStatus:
+            status?.response.ok === true && ready.safeParse(status.value).success ? "ready" : "unavailable",
+          wdaStatus: stateMatch[4],
+          activeSessionCount,
+          processes: {
+            appium: stateMatch[1] === "1",
+            xcodebuild: stateMatch[2] === "1",
+            wda: stateMatch[3] === "1",
+          },
+        },
+        ...(terminal
+          ? {
+              earliestTermination: {
+                sequence: terminal.sequence,
+                source: terminal.source,
+                event: terminal.event,
+                ...("alias" in terminal ? { alias: terminal.alias } : {}),
+                ...("cause" in terminal ? { cause: terminal.cause } : {}),
+              },
+            }
+          : {}),
+      });
+      const bytes = new TextEncoder().encode(JSON.stringify(diagnostic));
+      if (bytes.byteLength > limits.maxFileBytes || bytes.byteLength > limits.maxTotalBytes)
+        throw new Error("limit");
+      return ok(bytes);
+    } catch {
+      return err({
+        code: "EvidenceIncomplete",
+        phase: "evidence",
+        message: "Guest lifecycle diagnostic validation failed.",
+        retryDisposition: "notApplicable",
+      });
     }
-    return ok(new TextEncoder().encode(JSON.stringify({ schemaVersion: 1, files: records })));
   }
 }

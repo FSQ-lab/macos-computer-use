@@ -87,6 +87,10 @@ export interface DesktopPort {
     observation: Observation,
     signal: AbortSignal,
   ): Promise<OperationResult<{ status: "passed" | "failed" | "unverifiable"; reason: string }>>;
+  preflightAssertion(
+    assertion: AssertionSpec,
+    observation: Observation,
+  ): OperationResult<{ status: "admissible" | "unverifiable"; reason: string }>;
   compact(observation: Observation): string;
   query(observation: Observation, query: ElementQuery): OperationResult<ElementRef>;
   queryPage?(

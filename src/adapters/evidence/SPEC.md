@@ -42,7 +42,7 @@ Kernel is the only caller authorized to assign and append sequence. The Adapter 
 
 The Adapter writes a Run temporary regular file, enforces type/size policy, fsyncs it, computes SHA-256, atomically renames it to the content-addressed Run path, fsyncs the parent directory, and returns a descriptor for Kernel to append as an event. Existing hashes are reused only after size/content verification. Unreferenced temporary files are orphaned and isolated or removed during recovery.
 
-Artifact descriptors contain type, relative path, MIME, byte size, SHA-256, and sensitivity (`normal` or `potentiallySensitive`). Core types include display screenshot, UI snapshot, sanitized environment/config, Driver log, Guest log, and controlled diagnostics.
+Artifact descriptors contain type, relative path, MIME, byte size, SHA-256, and sensitivity (`normal` or `potentiallySensitive`). Artifact type/MIME pairs are closed to effective config, environment, lifecycle diagnostics, UI snapshot, display/window PNG screenshot, and Kernel-created `hook-*` binary contributions. Core JSON types use their strict owned schema, UI snapshots must be JSON objects, and screenshots require the PNG signature. Unknown types or mismatched MIME are rejected. Raw Driver, WDA, xcodebuild, and Guest process logs are not Artifact types and cannot be disguised under another type/MIME.
 
 ## Manifest And Integrity
 
@@ -58,7 +58,7 @@ Default retention is seven days; `null` disables automatic deletion. Active Runs
 
 ## Sensitive Data
 
-The Adapter never receives secret plaintext as intended metadata. Structured inputs are sanitized before commit. Screenshots and raw diagnostic logs are marked potentially sensitive. Display screenshots are stored normally without secret masking or visual secret detection, even when the selected application displays a Secret value. This explicit image exception does not relax structured-data or log sanitization. A sanitization failure rejects the diagnostic Artifact rather than persisting suspected secret content. Debug mode cannot relax these rules.
+The Adapter never receives secret plaintext as intended metadata. Structured inputs are sanitized before commit. Display screenshots and lifecycle diagnostics are marked potentially sensitive. Display screenshots are stored normally without secret masking or visual secret detection, even when the selected application displays a Secret value. This explicit image exception does not relax structured-data or diagnostic restrictions. Before committing a lifecycle diagnostic, EvidencePort parses the strict versioned schema and rejects forbidden/unknown fields; it never accepts a raw log Artifact under another type or MIME. Debug mode cannot relax these rules.
 
 ## Internal Structure
 

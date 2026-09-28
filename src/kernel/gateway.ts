@@ -98,6 +98,101 @@ export type InteractiveRun = {
 export class Gateway {
   constructor(private readonly deps: GatewayDependencies) {}
 
+  async #preflightFinalAssertions(
+    assertions: readonly AssertionSpec[],
+    observation: Observation,
+  ): Promise<OperationResult<void>> {
+    if (observation.coverage !== "complete")
+      return err({
+        code: "SnapshotIncomplete",
+        phase: "observe",
+        message: "Final assertions require a complete current Observation.",
+        retryDisposition: "safe",
+      });
+    const invalid = (message: string): OperationResult<void> =>
+      err({
+        code: "InvalidScenario",
+        phase: "action",
+        message,
+        retryDisposition: "safe",
+        dispatch: "notDispatched",
+      });
+    const byQuery = new Map<string, AssertionSpec[]>();
+    for (const assertion of assertions) {
+      if (assertion.kind === "aiVisual") {
+        const evaluated = this.deps.desktop.preflightAssertion(assertion, observation);
+        if (!evaluated.ok || evaluated.value.status !== "admissible")
+          return invalid("Final visual assertion is not currently evaluable.");
+        continue;
+      }
+      if (assertion.kind === "elementOrder") {
+        const evaluated = this.deps.desktop.preflightAssertion(assertion, observation);
+        if (!evaluated.ok || evaluated.value.status !== "admissible")
+          return invalid("Final element-order assertion target is not unique with geometry.");
+        continue;
+      }
+      const key = JSON.stringify(assertion.query);
+      const peers = byQuery.get(key) ?? [];
+      peers.push(assertion);
+      byQuery.set(key, peers);
+      if (assertion.kind === "state" && assertion.query.state)
+        for (const [field, expected] of Object.entries(assertion.state)) {
+          const constrained = assertion.query.state[field as keyof typeof assertion.query.state];
+          if (constrained !== undefined && constrained !== expected)
+            return invalid("Final assertion state contradicts its query state.");
+        }
+      const page = this.deps.desktop.queryPage?.(observation, assertion.query, 0, 100);
+      if (!page?.ok || page.value.status === "incomplete" || page.value.status === "ambiguous")
+        return invalid("Final assertion target is ambiguous or incomplete.");
+      if (page.value.status === "notFound") {
+        if (
+          assertion.kind !== "notVisible" &&
+          assertion.query.identifier === undefined &&
+          assertion.query.ancestor === undefined &&
+          assertion.query.descendant === undefined
+        )
+          return invalid("Absent final assertion target requires a stable structural anchor.");
+        continue;
+      }
+      const evaluated = this.deps.desktop.preflightAssertion(assertion, observation);
+      if (!evaluated.ok || evaluated.value.status !== "admissible")
+        return invalid("Final assertion requires currently observable fields.");
+    }
+    for (const peers of byQuery.values()) {
+      const hasNotVisible = peers.some((assertion) => assertion.kind === "notVisible");
+      if (hasNotVisible && peers.some((assertion) => assertion.kind !== "notVisible"))
+        return invalid("Final assertions contain contradictory presence requirements.");
+      for (const kind of ["text", "value"] as const) {
+        const matches = peers.filter(
+          (assertion): assertion is Extract<AssertionSpec, { kind: typeof kind }> => assertion.kind === kind,
+        );
+        for (let left = 0; left < matches.length; left += 1)
+          for (let right = left + 1; right < matches.length; right += 1) {
+            const first = matches[left];
+            const second = matches[right];
+            if (!first || !second) continue;
+            const compatible =
+              first.match === "exact" && second.match === "exact"
+                ? first.expected === second.expected
+                : first.match === "exact"
+                  ? first.expected.includes(second.expected)
+                  : second.match === "exact"
+                    ? second.expected.includes(first.expected)
+                    : true;
+            if (!compatible) return invalid("Final assertions contain contradictory text requirements.");
+          }
+      }
+      const states = peers.filter(
+        (assertion): assertion is Extract<AssertionSpec, { kind: "state" }> => assertion.kind === "state",
+      );
+      for (const field of ["enabled", "selected", "focused"] as const) {
+        const expected = new Set(states.flatMap((assertion) => assertion.state[field] ?? []));
+        if (expected.size > 1) return invalid("Final assertions contain contradictory state requirements.");
+      }
+    }
+    return ok(undefined);
+  }
+
   async execute(
     config: GatewayConfig,
     scenario: Scenario,
@@ -614,8 +709,7 @@ export class Gateway {
       } finally {
         environment.beginCleanup();
         evidenceDeadline = this.deps.clock.monotonicMs() + config.timeouts.evidenceFinalizeMs;
-        await append("CleanupStarted", {});
-        if (cloneName && appiumStarted) {
+        if (cloneName) {
           const diagnostics = await this.#cleanupValue(evidenceRemaining(), (cleanupSignal) =>
             this.deps.guest.exportDiagnostics(
               cloneName as string,
@@ -649,6 +743,7 @@ export class Gateway {
             } else evidenceState.complete = false;
           } else evidenceState.complete = false;
         }
+        await append("CleanupStarted", {});
         const cleanupStarted = this.deps.clock.monotonicMs();
         const cleanupRemaining = (): number =>
           Math.max(0, config.timeouts.cleanupMs - (this.deps.clock.monotonicMs() - cleanupStarted));
@@ -1170,6 +1265,14 @@ export class Gateway {
                 message: "Run scope is closed.",
                 retryDisposition: "notApplicable",
               });
+            if (operationActive)
+              return err({
+                code: "GatewayBusy",
+                phase: "action",
+                message: "Another Run operation is active.",
+                retryDisposition: "safe",
+                dispatch: "notDispatched",
+              });
             if (assertionsFrozen)
               return err({
                 code: "InvalidScenario",
@@ -1177,29 +1280,41 @@ export class Gateway {
                 message: "Final assertions are already frozen.",
                 retryDisposition: "notApplicable",
               });
-            const parsed = assertions.map((assertion) => AssertionSpecSchema.safeParse(assertion));
-            if (parsed.length === 0 || parsed.some((item) => !item.success) || !observation)
-              return err({
-                code: "InvalidScenario",
-                phase: "action",
-                message: "Final assertions require a current Observation and valid nonempty input.",
-                retryDisposition: "safe",
-              });
-            const frozen = parsed.flatMap((item) => (item.success ? [item.data] : []));
-            const recorded = await append("FinalAssertionsFrozen", {
-              count: frozen.length,
-              observationId: observation.observationId,
+            operationActive = true;
+            operationSettled = new Promise<void>((resolve) => {
+              settleOperation = resolve;
             });
-            if (!recorded)
-              return err({
-                code: "EvidenceIncomplete",
-                phase: "evidence",
-                message: "Final assertion freeze Evidence could not be committed.",
-                retryDisposition: "notApplicable",
+            try {
+              const parsed = assertions.map((assertion) => AssertionSpecSchema.safeParse(assertion));
+              if (parsed.length === 0 || parsed.some((item) => !item.success) || !observation)
+                return err({
+                  code: "InvalidScenario",
+                  phase: "action",
+                  message: "Final assertions require a current Observation and valid nonempty input.",
+                  retryDisposition: "safe",
+                });
+              const frozen = parsed.flatMap((item) => (item.success ? [item.data] : []));
+              const current = observation;
+              const preflight = await this.#preflightFinalAssertions(frozen, current);
+              if (!preflight.ok) return preflight;
+              const recorded = await append("FinalAssertionsFrozen", {
+                count: frozen.length,
+                observationId: current.observationId,
               });
-            finalAssertions = structuredClone(frozen);
-            assertionsFrozen = true;
-            return ok({ frozen: true as const });
+              if (!recorded)
+                return err({
+                  code: "EvidenceIncomplete",
+                  phase: "evidence",
+                  message: "Final assertion freeze Evidence could not be committed.",
+                  retryDisposition: "notApplicable",
+                });
+              finalAssertions = structuredClone(frozen);
+              assertionsFrozen = true;
+              return ok({ frozen: true as const });
+            } finally {
+              operationActive = false;
+              settleOperation?.();
+            }
           },
           queryPage: (query, options) => {
             if (closed)
@@ -1753,8 +1868,7 @@ export class Gateway {
         closed = true;
         environment.beginCleanup();
         evidenceDeadline = this.deps.clock.monotonicMs() + config.timeouts.evidenceFinalizeMs;
-        await append("CleanupStarted", {});
-        if (cloneName && appiumStarted) {
+        if (cloneName) {
           const diagnostics = await this.#cleanupValue(evidenceRemaining(), (cleanupSignal) =>
             this.deps.guest.exportDiagnostics(
               cloneName as string,
@@ -1788,6 +1902,7 @@ export class Gateway {
             } else evidenceState.complete = false;
           } else evidenceState.complete = false;
         }
+        await append("CleanupStarted", {});
         const cleanupStarted = this.deps.clock.monotonicMs();
         const cleanupRemaining = (): number =>
           Math.max(0, config.timeouts.cleanupMs - (this.deps.clock.monotonicMs() - cleanupStarted));
@@ -2181,15 +2296,6 @@ export class Gateway {
       : ok({ exists: false, state: "stopped" as const });
     if (!vmStatus.ok) return vmStatus;
     const isRunning = vmStatus.value.exists && vmStatus.value.state === "running";
-    const sessionClosed = isRunning
-      ? await this.deps.desktop.stopSession(signal)
-      : ok({
-          provider: "recovery",
-          operationId: this.deps.ids.next("operation") as OperationId,
-          dispatch: "notDispatched",
-          outcome: "succeeded",
-          startedAt: this.deps.clock.wallNow().toISOString(),
-        });
     const diagnostics = isRunning
       ? await this.deps.guest.exportDiagnostics(record.value.resourceId, diagnosticLimits, signal)
       : err<Uint8Array>({
@@ -2199,6 +2305,7 @@ export class Gateway {
           retryDisposition: "notApplicable",
         });
     const recoveryArtifacts: ArtifactDescriptor[] = [];
+    let recoverySequence = timeline.ok ? timeline.value.length + 1 : 0;
     if (diagnostics.ok) {
       const diagnosticArtifact = await this.deps.evidence.commitArtifact(
         {
@@ -2210,8 +2317,39 @@ export class Gateway {
         },
         signal,
       );
-      if (diagnosticArtifact.ok) recoveryArtifacts.push(diagnosticArtifact.value);
+      if (diagnosticArtifact.ok) {
+        recoveryArtifacts.push(diagnosticArtifact.value);
+        if (timeline.ok && recoveryStarted.ok) {
+          const committed = await this.deps.evidence.append(
+            {
+              schemaVersion: 1,
+              runId: record.value.runId,
+              sequence: ++recoverySequence,
+              recordedAt: this.deps.clock.wallNow().toISOString(),
+              elapsedMs: Math.max(0, this.deps.clock.monotonicMs() - recoveryStartedMono),
+              type: "ArtifactCommitted",
+              source: "kernel",
+              data: {
+                artifactId: diagnosticArtifact.value.artifactId,
+                type: diagnosticArtifact.value.type,
+                sha256: diagnosticArtifact.value.sha256,
+              },
+            },
+            signal,
+          );
+          if (!committed.ok) return committed;
+        }
+      }
     }
+    const sessionClosed = isRunning
+      ? await this.deps.desktop.stopSession(signal)
+      : ok({
+          provider: "recovery",
+          operationId: this.deps.ids.next("operation") as OperationId,
+          dispatch: "notDispatched",
+          outcome: "succeeded",
+          startedAt: this.deps.clock.wallNow().toISOString(),
+        });
     const appiumStopped = isRunning
       ? await this.deps.guest.stopAppium(record.value.resourceId, signal)
       : sessionClosed;
@@ -2249,7 +2387,7 @@ export class Gateway {
       {
         schemaVersion: 1,
         runId: record.value.runId,
-        sequence: timeline.value.length + 2,
+        sequence: recoverySequence + 1,
         recordedAt: this.deps.clock.wallNow().toISOString(),
         elapsedMs: Math.max(0, this.deps.clock.monotonicMs() - recoveryStartedMono),
         type: "RunRecoveryFinished",
@@ -2263,7 +2401,7 @@ export class Gateway {
     const recoveredEvent = parseEvidenceEvent({
       schemaVersion: 1,
       runId: recoveredRunId,
-      sequence: timeline.value.length + 2,
+      sequence: recoverySequence + 1,
       recordedAt: this.deps.clock.wallNow().toISOString(),
       elapsedMs: Math.max(0, this.deps.clock.monotonicMs() - recoveryStartedMono),
       type: "RunRecoveryFinished",
@@ -2275,7 +2413,7 @@ export class Gateway {
       hooks: this.deps.hooks ?? [],
       evidence: this.deps.evidence,
       artifacts: recoveryArtifacts,
-      sequence: timeline.value.length + 2,
+      sequence: recoverySequence + 1,
       startedMono: recoveryStartedMono,
       clock: this.deps.clock,
       signal,

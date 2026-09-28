@@ -14,12 +14,18 @@ class FakeSupervisor implements PiTaskSupervisor {
   readonly shutdowns: string[] = [];
   failAction = false;
   structuredFailure = false;
-  structuredFailureCode: "TargetNotFound" | "TargetAmbiguous" | "ReadinessExpired" = "TargetNotFound";
+  structuredFailureCode:
+    | "TargetNotFound"
+    | "TargetAmbiguous"
+    | "ReadinessExpired"
+    | "InvalidScenario"
+    | "SnapshotIncomplete" = "TargetNotFound";
   actionResultFailure = false;
   structuredStartFailure = false;
   pendingAction: Promise<TaskValue> | undefined;
   pendingShutdown: Promise<void> | undefined;
   assertionStatus: "passed" | "failed" | "unverifiable" = "failed";
+  freezeFailure = false;
 
   async start(
     application: Extract<TaskOperationInput, { type: "begin" }>["application"],
@@ -88,6 +94,12 @@ class FakeSupervisor implements PiTaskSupervisor {
           ...(input.query.identifier ? { identifier: input.query.identifier } : {}),
         },
       };
+    if (input.type === "freezeAssertions" && this.freezeFailure)
+      throw new PiTaskRequestError({
+        code: "ClientFailure",
+        clientCode: "InvalidScenario",
+        message: "InvalidScenario: final assertions are not structurally evaluable.",
+      });
     if (input.type === "freezeAssertions")
       return { kind: "assertionsFrozen", count: input.assertions.length };
     if (input.type === "expand")
@@ -878,6 +890,39 @@ describe("Pi extension", () => {
     ).resolves.toBeTruthy();
   });
 
+  it("clears stale discovery recovery on a new turn only after the prior task closes", async () => {
+    const state = setup();
+    await begin(state);
+    state.supervisor.structuredFailure = true;
+    state.supervisor.structuredFailureCode = "TargetAmbiguous";
+    const action = state.tools.get("macos_action");
+    const abort = state.tools.get("macos_abort");
+    const beginTool = state.tools.get("macos_begin");
+    if (!action || !abort || !beginTool) throw new Error("tool missing");
+    await action.execute(
+      "ambiguous",
+      { target: { identifier: "fixture.save" }, action: { kind: "click" } },
+      undefined,
+      undefined,
+      state.context,
+    );
+    state.beforeAgentStart("continue active task");
+    await expect(state.toolCall("macos_action")).resolves.toMatchObject({ block: true });
+    state.supervisor.structuredFailure = false;
+    await abort.execute("abort", { reason: "close prior task" }, undefined, undefined, state.context);
+    state.beforeAgentStart("start another task");
+    await expect(state.toolCall("macos_begin")).resolves.toBeUndefined();
+    await expect(
+      beginTool.execute(
+        "new-begin",
+        { application: { name: "Fixture" } },
+        undefined,
+        undefined,
+        state.context,
+      ),
+    ).resolves.toBeTruthy();
+  });
+
   it("requires exact relationship-query provenance before relationship actions", async () => {
     const state = setup();
     await begin(state);
@@ -907,6 +952,71 @@ describe("Pi extension", () => {
         state.context,
       ),
     ).resolves.toBeTruthy();
+  });
+
+  it("returns freeze preflight rejection without consuming the retry or shutting down", async () => {
+    const state = setup();
+    const beginTool = state.tools.get("macos_begin");
+    const freeze = state.tools.get("macos_freeze_assertions");
+    if (!beginTool || !freeze) throw new Error("tool missing");
+    await beginTool.execute(
+      "begin",
+      { application: { name: "Fixture" } },
+      undefined,
+      undefined,
+      state.context,
+    );
+    state.supervisor.freezeFailure = true;
+    const rejected = await freeze.execute(
+      "bad-freeze",
+      { assertions: [{ kind: "visible", query: { role: "button" } }] },
+      undefined,
+      undefined,
+      state.context,
+    );
+    expect(rejected.details).toMatchObject({
+      kind: "error",
+      error: { code: "ClientFailure", clientCode: "InvalidScenario" },
+    });
+    expect(state.supervisor.shutdowns).toEqual([]);
+    state.supervisor.freezeFailure = false;
+    await expect(
+      freeze.execute(
+        "corrected-freeze",
+        { assertions: [{ kind: "visible", query: { identifier: "fixture.save" } }] },
+        undefined,
+        undefined,
+        state.context,
+      ),
+    ).resolves.toBeTruthy();
+  });
+
+  it("returns incomplete freeze preflight as a structured retryable result", async () => {
+    const state = setup();
+    const beginTool = state.tools.get("macos_begin");
+    const freeze = state.tools.get("macos_freeze_assertions");
+    if (!beginTool || !freeze) throw new Error("tool missing");
+    await beginTool.execute(
+      "begin",
+      { application: { name: "Fixture" } },
+      undefined,
+      undefined,
+      state.context,
+    );
+    state.supervisor.structuredFailure = true;
+    state.supervisor.structuredFailureCode = "SnapshotIncomplete";
+    const rejected = await freeze.execute(
+      "incomplete-freeze",
+      { assertions: [{ kind: "visible", query: { role: "button" } }] },
+      undefined,
+      undefined,
+      state.context,
+    );
+    expect(rejected.details).toMatchObject({
+      kind: "error",
+      error: { code: "ClientFailure", clientCode: "SnapshotIncomplete" },
+    });
+    expect(state.supervisor.shutdowns).toEqual([]);
   });
 
   it("blocks extra model work once frozen final assertions pass and permits finish", async () => {

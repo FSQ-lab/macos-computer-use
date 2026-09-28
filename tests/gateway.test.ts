@@ -226,7 +226,7 @@ describe("gateway", () => {
     roots.push(root);
     const platform = new FakePlatform();
     const clock = new TestClock();
-    vi.spyOn(platform, "exportDiagnostics").mockImplementation(async () => {
+    const exportDiagnostics = vi.spyOn(platform, "exportDiagnostics").mockImplementation(async () => {
       clock.value += 119_000;
       return ok(new TextEncoder().encode("diagnostics"));
     });
@@ -257,10 +257,106 @@ describe("gateway", () => {
       new AbortController().signal,
     );
     expect(result.ok && result.value.result.cleanup).toBe("completed");
+    expect(exportDiagnostics).toHaveBeenCalledOnce();
     expect(stopSession).toHaveBeenCalledOnce();
     expect(stopAppium).toHaveBeenCalledOnce();
     expect(stopVm).toHaveBeenCalledOnce();
     expect(destroy).toHaveBeenCalledOnce();
+  });
+  it("captures and commits diagnostics before cleanup begins or providers stop", async () => {
+    const root = await mkdtemp(join(tmpdir(), "mcu-pre-cleanup-diagnostics-"));
+    roots.push(root);
+    const platform = new FakePlatform();
+    const calls: string[] = [];
+    vi.spyOn(platform, "exportDiagnostics").mockImplementation(async (...args) => {
+      calls.push("diagnostics");
+      return FakePlatform.prototype.exportDiagnostics.call(platform, ...args);
+    });
+    vi.spyOn(platform, "stopSession").mockImplementation(async () => {
+      calls.push("stopSession");
+      return ok(receipt());
+    });
+    vi.spyOn(platform, "stopAppium").mockImplementation(async () => {
+      calls.push("stopAppium");
+      return ok(receipt());
+    });
+    const evidence = new LocalEvidenceAdapter(join(root, "evidence"), join(root, "state"), 10_000);
+    const gateway = new Gateway({
+      image: platform,
+      vm: platform,
+      guest: platform,
+      desktop: platform,
+      evidence,
+      clock: new TestClock(),
+      ids: new TestIds(),
+      ...support,
+      lock: { acquire: async () => ok(async () => undefined) },
+      buildVersion: "test",
+    });
+    const result = await gateway.execute(
+      config(root),
+      {
+        schemaVersion: 1,
+        name: "pre-cleanup-diagnostics",
+        actions: [],
+        finalAssertions: [{ kind: "visible", query: { role: "button" } }],
+      },
+      new AbortController().signal,
+    );
+    expect(result.ok).toBe(true);
+    expect(calls.slice(0, 3)).toEqual(["diagnostics", "stopSession", "stopAppium"]);
+    if (!result.ok) return;
+    const timeline = await evidence.readTimeline(result.value.runId);
+    expect(timeline.ok).toBe(true);
+    if (!timeline.ok) return;
+    const artifactIndex = timeline.value.findIndex(
+      (event) => event.type === "ArtifactCommitted" && event.data.type === "guest-diagnostics",
+    );
+    const cleanupIndex = timeline.value.findIndex((event) => event.type === "CleanupStarted");
+    expect(artifactIndex).toBeGreaterThanOrEqual(0);
+    expect(cleanupIndex).toBeGreaterThan(artifactIndex);
+  });
+  it("attempts diagnostics after clone allocation even when Appium launch does not reach readiness", async () => {
+    const root = await mkdtemp(join(tmpdir(), "mcu-appium-start-diagnostics-"));
+    roots.push(root);
+    const platform = new FakePlatform();
+    vi.spyOn(platform, "startAppium").mockResolvedValue({
+      ok: false,
+      error: {
+        code: "SessionUnavailable",
+        phase: "guest",
+        message: "Guest Appium readiness has not passed.",
+        retryDisposition: "safe",
+      },
+    });
+    const exportDiagnostics = vi.spyOn(platform, "exportDiagnostics");
+    const gateway = new Gateway({
+      image: platform,
+      vm: platform,
+      guest: platform,
+      desktop: platform,
+      evidence: new LocalEvidenceAdapter(join(root, "evidence"), join(root, "state"), 10_000),
+      clock: new TestClock(),
+      ids: new TestIds(),
+      ...support,
+      lock: { acquire: async () => ok(async () => undefined) },
+      buildVersion: "test",
+    });
+    const result = await gateway.execute(
+      {
+        ...config(root),
+        retry: { ...config(root).retry, readiness: { maxAttempts: 1, backoffMs: 1 } },
+      },
+      {
+        schemaVersion: 1,
+        name: "appium-start-diagnostics",
+        actions: [],
+        finalAssertions: [{ kind: "visible", query: { role: "button" } }],
+      },
+      new AbortController().signal,
+    );
+    expect(result.ok && result.value.result.verdict).toBe("inconclusive");
+    expect(exportDiagnostics).toHaveBeenCalledOnce();
   });
   it("passes only the ImagePort request contract at the adapter boundary", async () => {
     const root = await mkdtemp(join(tmpdir(), "mcu-image-request-"));
@@ -724,6 +820,120 @@ describe("gateway", () => {
       bundleId: "com.apple.Safari",
       window: { role: "window" },
     });
+  });
+  it("atomically preflights Pi final assertions and permits a corrected retry", async () => {
+    const root = await mkdtemp(join(tmpdir(), "mcu-freeze-preflight-"));
+    roots.push(root);
+    const platform = new FakePlatform();
+    const evidence = new LocalEvidenceAdapter(join(root, "evidence"), join(root, "state"), 10_000);
+    const gateway = new Gateway({
+      image: platform,
+      vm: platform,
+      guest: platform,
+      desktop: platform,
+      evidence,
+      clock: new TestClock(),
+      ids: new TestIds(),
+      ...support,
+      lock: { acquire: async () => ok(async () => undefined) },
+      buildVersion: "test",
+    });
+    const result = await gateway.executeInteractive(
+      config(root),
+      [],
+      async (run) => {
+        expect(
+          await run.freezeFinalAssertions([
+            { kind: "state", query: { role: "button" }, state: { selected: true } },
+          ]),
+        ).toMatchObject({ ok: false, error: { code: "InvalidScenario" } });
+        expect(
+          await run.freezeFinalAssertions([
+            { kind: "visible", query: { role: "button" } },
+            { kind: "notVisible", query: { role: "button" } },
+          ]),
+        ).toMatchObject({ ok: false, error: { code: "InvalidScenario" } });
+        expect(
+          await run.freezeFinalAssertions([
+            { kind: "visible", query: { role: "statictext", value: { exact: "Future" } } },
+          ]),
+        ).toMatchObject({ ok: false, error: { code: "InvalidScenario" } });
+        expect(
+          await run.freezeFinalAssertions([
+            {
+              kind: "value",
+              query: {
+                role: "group",
+                value: { exact: "Future" },
+                descendant: { role: "checkbox" },
+              },
+              expected: "Future",
+              match: "exact",
+            },
+          ]),
+        ).toEqual({ ok: true, value: { frozen: true } });
+      },
+      new AbortController().signal,
+      undefined,
+      { name: "Fixture" },
+    );
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    const timeline = await evidence.readTimeline(result.value.runId);
+    expect(timeline.ok).toBe(true);
+    expect(
+      timeline.ok && timeline.value.filter((event) => event.type === "FinalAssertionsFrozen"),
+    ).toHaveLength(1);
+  });
+  it("serializes final assertion freeze against an active Run operation", async () => {
+    const root = await mkdtemp(join(tmpdir(), "mcu-freeze-serialization-"));
+    roots.push(root);
+    const platform = new FakePlatform();
+    let releaseObservation: (() => void) | undefined;
+    let observationCalls = 0;
+    const observe = platform.observe.bind(platform);
+    vi.spyOn(platform, "observe").mockImplementation(async (request, signal) => {
+      observationCalls += 1;
+      if (observationCalls > 1)
+        await new Promise<void>((resolve) => {
+          releaseObservation = resolve;
+        });
+      return observe(request, signal);
+    });
+    const gateway = new Gateway({
+      image: platform,
+      vm: platform,
+      guest: platform,
+      desktop: platform,
+      evidence: new LocalEvidenceAdapter(join(root, "evidence"), join(root, "state"), 10_000),
+      clock: new TestClock(),
+      ids: new TestIds(),
+      ...support,
+      lock: { acquire: async () => ok(async () => undefined) },
+      buildVersion: "test",
+    });
+    const result = await gateway.executeInteractive(
+      config(root),
+      [],
+      async (run) => {
+        const pending = run.observe();
+        for (let attempt = 0; attempt < 100 && !releaseObservation; attempt += 1)
+          await new Promise<void>((resolve) => setImmediate(resolve));
+        expect(
+          await run.freezeFinalAssertions([{ kind: "visible", query: { role: "button" } }]),
+        ).toMatchObject({ ok: false, error: { code: "GatewayBusy" } });
+        releaseObservation?.();
+        await pending;
+        expect(await run.freezeFinalAssertions([{ kind: "visible", query: { role: "button" } }])).toEqual({
+          ok: true,
+          value: { frozen: true },
+        });
+      },
+      new AbortController().signal,
+      undefined,
+      { name: "Fixture" },
+    );
+    expect(result.ok).toBe(true);
   });
 
   it("keeps a Pi-selected interactive Run usable after initial readiness freshness expires", async () => {
@@ -1511,10 +1721,12 @@ describe("gateway", () => {
         imageDigest: `sha256:${"a".repeat(64)}`,
         phase: "clonePlanned",
       });
+    if (hasRecord)
+      vi.spyOn(platform, "listManaged").mockResolvedValue(ok(["mcu-run-00000001"] as readonly string[]));
     const artifact = await evidence.commitArtifact({
       runId,
-      type: "test-data",
-      mimeType: "text/plain",
+      type: "hook-test-data",
+      mimeType: "application/octet-stream",
       sensitivity: "normal",
       bytes: new TextEncoder().encode("durable-before-crash"),
     });
@@ -1551,6 +1763,18 @@ describe("gateway", () => {
     expect(shown.ok && shown.value.artifacts.some((item) => item.sha256 === artifact.value.sha256)).toBe(
       true,
     );
+    if (hasRecord && shown.ok) {
+      const diagnostic = shown.value.artifacts.find((item) => item.type === "guest-diagnostics");
+      expect(diagnostic).toBeDefined();
+      const recoveredTimeline = await evidence.readTimeline(runId);
+      expect(recoveredTimeline.ok).toBe(true);
+      if (diagnostic && recoveredTimeline.ok)
+        expect(
+          recoveredTimeline.value.some(
+            (event) => event.type === "ArtifactCommitted" && event.data.artifactId === diagnostic.artifactId,
+          ),
+        ).toBe(true);
+    }
     expect(shown.ok && shown.value.result).toEqual({
       verdict: "inconclusive",
       evidence: "incomplete",

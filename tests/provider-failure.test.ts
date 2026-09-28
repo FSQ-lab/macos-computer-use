@@ -3,7 +3,12 @@ import { readFile } from "node:fs/promises";
 import { promisify } from "node:util";
 import { resolve } from "node:path";
 import { describe, expect, it } from "vitest";
-import { createMacOSComputerUseClient, GatewayConfigSchema, ScenarioSchema } from "../src/index.js";
+import {
+  createMacOSComputerUseClient,
+  GatewayConfigSchema,
+  ProviderLifecycleDiagnosticSchema,
+  ScenarioSchema,
+} from "../src/index.js";
 
 const configPath = process.env.MCU_PROVIDER_CONFIG;
 const profile = process.env.MCU_PROVIDER_PROFILE;
@@ -114,6 +119,22 @@ describe.skipIf(!configPath || profile !== "failure")("provisioned provider fail
       retryDisposition: "reconcileRequired",
     });
     expect(result.ok && result.value.result.verdict).toBe("inconclusive");
+    if (!result.ok) return;
+    const manifest = await client.value.showRun(result.value.runId);
+    if (!manifest.ok) throw new Error(manifest.error.message);
+    const diagnostic = manifest.value.artifacts.find((artifact) => artifact.type === "guest-diagnostics");
+    if (!diagnostic) throw new Error("Lifecycle diagnostic missing");
+    const raw = await readFile(
+      `${config.evidence.root}/runs/${result.value.runId}/${diagnostic.relativePath}`,
+    );
+    const lifecycle = ProviderLifecycleDiagnosticSchema.parse(JSON.parse(raw.toString("utf8")) as unknown);
+    expect(lifecycle.earliestTermination).toMatchObject({
+      source: "appium",
+      event: "processExited",
+      cause: "providerExit",
+    });
+    expect(lifecycle.snapshot.observedBeforeCleanup).toBe(true);
+    expect(raw.toString("utf8")).not.toMatch(/[0-9a-f]{8}-[0-9a-f-]{27,}/iu);
     expect(await managedClones()).toEqual([]);
     expect(await client.value.recover()).toEqual({ ok: true, value: { status: "clean" } });
   }, 600_000);

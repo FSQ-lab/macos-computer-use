@@ -19,6 +19,7 @@ import {
   ArtifactRefSchema,
   ConfigSnapshotSchema,
   EnvironmentSnapshotSchema,
+  ProviderLifecycleDiagnosticSchema,
   EvidenceEventSchema,
   parseEvidenceEvent,
   parseCurrentEvidenceEvent,
@@ -1078,10 +1079,34 @@ export class LocalEvidenceAdapter implements EvidencePort {
   }
 
   #validateSnapshot(type: string, bytes: Uint8Array): void {
-    if (type !== "effective-config" && type !== "environment") return;
+    if (type !== "display-screenshot" && type !== "window-screenshot") {
+      const prefix = Buffer.from(bytes).subarray(0, Math.min(bytes.byteLength, 1_000_000)).toString("utf8");
+      if (
+        /(?:^|\n)(?:\[[^\n]{0,120}\])?(?:\s*\[[^\n]{0,120}\])?\s*(?:Proxying \[|Got response with status|Session created with session id:|Removing session .* from our master session list|Ending session, cause was|Mac2Driver host process has exited|Starting Mac2Driver host process:|\*\* TEST (?:FAILED|SUCCEEDED) \*\*)/mu.test(
+          prefix,
+        )
+      )
+        throw new Error("raw provider log");
+    }
+    if (type === "display-screenshot" || type === "window-screenshot") {
+      const signature = [0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a];
+      if (bytes.byteLength < signature.length || !signature.every((byte, index) => bytes[index] === byte))
+        throw new Error("invalid png artifact");
+      return;
+    }
+    if (type.startsWith("hook-")) return;
+    if (
+      type !== "effective-config" &&
+      type !== "environment" &&
+      type !== "guest-diagnostics" &&
+      type !== "ui-snapshot"
+    )
+      throw new Error("unsupported artifact type");
     const input: unknown = JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(bytes));
     if (type === "effective-config") ConfigSnapshotSchema.parse(input);
-    else EnvironmentSnapshotSchema.parse(input);
+    else if (type === "environment") EnvironmentSnapshotSchema.parse(input);
+    else if (type === "guest-diagnostics") ProviderLifecycleDiagnosticSchema.parse(input);
+    else z.record(z.string(), z.unknown()).parse(input);
   }
 
   #rejectSymlinks(root: string, target: string): void {

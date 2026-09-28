@@ -701,6 +701,53 @@ export class Mac2DesktopAdapter implements DesktopPort {
     });
   }
 
+  preflightAssertion(
+    assertion: AssertionSpec,
+    observation: Observation,
+  ): OperationResult<{ status: "admissible" | "unverifiable"; reason: string }> {
+    const unverifiable = (reason: string) => ok({ status: "unverifiable" as const, reason });
+    if (observation.coverage !== "complete") return unverifiable("Snapshot coverage is incomplete.");
+    if (assertion.kind === "aiVisual")
+      return this.visualEvaluator &&
+        this.#visualScreenshot?.observationId === observation.observationId &&
+        observation.screenshot !== undefined
+        ? ok({ status: "admissible", reason: "Current visual evidence and evaluator are available." })
+        : unverifiable("Current visual evidence or evaluator is unavailable.");
+    if (assertion.kind === "elementOrder") {
+      for (const query of assertion.queries) {
+        const matches = observation.elements.filter((element) =>
+          this.#matches(element, query, observation.elements),
+        );
+        if (matches.length !== 1 || !matches[0]?.geometry)
+          return unverifiable("Element order target is not unique or lacks geometry.");
+      }
+      return ok({ status: "admissible", reason: "Element order targets are structurally evaluable." });
+    }
+    const matches = observation.elements.filter((element) =>
+      this.#matches(element, assertion.query, observation.elements),
+    );
+    if (matches.length > 1) return unverifiable("Assertion target is ambiguous.");
+    if (matches.length === 0)
+      return ok({ status: "admissible", reason: "Assertion is a deterministic unmet future target." });
+    const element = matches[0];
+    if (!element) return unverifiable("Assertion target is unavailable.");
+    if ((assertion.kind === "visible" || assertion.kind === "notVisible") && element.visible === undefined)
+      return unverifiable("Visibility state is not observable.");
+    if (assertion.kind === "value" && element.value === undefined)
+      return unverifiable("Value state is not observable.");
+    if (
+      assertion.kind === "text" &&
+      element.name === undefined &&
+      element.label === undefined &&
+      element.value === undefined
+    )
+      return unverifiable("Text state is not observable.");
+    if (assertion.kind === "state")
+      for (const field of Object.keys(assertion.state) as (keyof typeof assertion.state)[])
+        if (element[field] === undefined) return unverifiable("Requested state is not observable.");
+    return ok({ status: "admissible", reason: "Assertion is structurally evaluable." });
+  }
+
   async stopSession(signal: AbortSignal): Promise<OperationResult<ProviderReceipt>> {
     const startedAt = new Date().toISOString();
     try {

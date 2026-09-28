@@ -30,6 +30,145 @@ export const ArtifactDescriptorSchema = z
   })
   .strict();
 
+export const ProviderLifecycleAliasSchema = z.string().regex(/^(?:outer|inner)-[1-9][0-9]{0,3}$/);
+export const ProviderLifecycleSourceSchema = z.enum(["appium", "wda", "xcodebuild"]);
+export const ProviderLifecycleEventTypeSchema = z.enum([
+  "sessionCreated",
+  "sessionDeleteRequested",
+  "sessionRemoved",
+  "sessionReplaced",
+  "unexpectedShutdown",
+  "processExited",
+]);
+export const ProviderLifecycleCauseSchema = z.enum([
+  "explicitDelete",
+  "newCommandTimeout",
+  "unexpectedShutdown",
+  "replacement",
+  "providerExit",
+  "unknown",
+]);
+export const ProviderTerminationEventTypeSchema = z.enum([
+  "sessionDeleteRequested",
+  "sessionRemoved",
+  "sessionReplaced",
+  "unexpectedShutdown",
+  "processExited",
+]);
+const lifecycleBase = {
+  sequence: z.number().int().positive().max(10_000),
+  recordedAt: z.iso.datetime(),
+  observedBeforeCleanup: z.literal(true),
+};
+export const ProviderLifecycleEventSchema = z.discriminatedUnion("event", [
+  z
+    .object({
+      ...lifecycleBase,
+      source: z.enum(["appium", "wda"]),
+      event: z.literal("sessionCreated"),
+      alias: ProviderLifecycleAliasSchema,
+    })
+    .strict(),
+  z
+    .object({
+      ...lifecycleBase,
+      source: z.enum(["appium", "wda"]),
+      event: z.literal("sessionDeleteRequested"),
+      alias: ProviderLifecycleAliasSchema,
+      cause: z.literal("explicitDelete"),
+    })
+    .strict(),
+  z
+    .object({
+      ...lifecycleBase,
+      source: z.enum(["appium", "wda"]),
+      event: z.literal("sessionRemoved"),
+      alias: ProviderLifecycleAliasSchema,
+      cause: z.enum(["unexpectedShutdown", "unknown"]),
+    })
+    .strict(),
+  z
+    .object({
+      ...lifecycleBase,
+      source: z.literal("wda"),
+      event: z.literal("sessionReplaced"),
+      alias: ProviderLifecycleAliasSchema,
+      cause: z.literal("replacement"),
+    })
+    .strict(),
+  z
+    .object({
+      ...lifecycleBase,
+      source: z.literal("appium"),
+      event: z.literal("unexpectedShutdown"),
+      cause: z.enum(["newCommandTimeout", "unexpectedShutdown"]),
+    })
+    .strict(),
+  z
+    .object({
+      ...lifecycleBase,
+      source: ProviderLifecycleSourceSchema,
+      event: z.literal("processExited"),
+      cause: z.literal("providerExit"),
+      exitCode: z.number().int().min(0).max(255).optional(),
+      signal: z.enum(["SIGABRT", "SIGBUS", "SIGILL", "SIGKILL", "SIGSEGV", "SIGTERM"]).optional(),
+    })
+    .strict(),
+]);
+export const ProviderLifecycleDiagnosticSchema = z
+  .object({
+    schemaVersion: z.literal(1),
+    compatibility: z
+      .object({
+        appium: z.string().regex(/^[0-9]+\.[0-9]+\.[0-9]+$/),
+        mac2: z.string().regex(/^[0-9]+\.[0-9]+\.[0-9]+$/),
+      })
+      .strict(),
+    events: z.array(ProviderLifecycleEventSchema).max(2_000),
+    snapshot: z
+      .object({
+        capturedAt: z.iso.datetime(),
+        observedBeforeCleanup: z.literal(true),
+        appiumStatus: z.enum(["ready", "unavailable"]),
+        wdaStatus: z.enum(["ready", "unavailable"]),
+        activeSessionCount: z.number().int().min(0).max(16).optional(),
+        processes: z.object({ appium: z.boolean(), xcodebuild: z.boolean(), wda: z.boolean() }).strict(),
+      })
+      .strict(),
+    earliestTermination: z
+      .object({
+        sequence: z.number().int().positive().max(10_000),
+        source: ProviderLifecycleSourceSchema,
+        event: ProviderTerminationEventTypeSchema,
+        alias: ProviderLifecycleAliasSchema.optional(),
+        cause: ProviderLifecycleCauseSchema.optional(),
+      })
+      .strict()
+      .optional(),
+  })
+  .strict()
+  .superRefine((diagnostic, ctx) => {
+    for (let index = 0; index < diagnostic.events.length; index += 1)
+      if (diagnostic.events[index]?.sequence !== index + 1)
+        ctx.addIssue({ code: "custom", path: ["events", index, "sequence"], message: "Invalid sequence." });
+    const terminal = diagnostic.events.find(
+      (event) => ProviderTerminationEventTypeSchema.safeParse(event.event).success,
+    );
+    if (terminal === undefined && diagnostic.earliestTermination !== undefined)
+      ctx.addIssue({ code: "custom", path: ["earliestTermination"], message: "Unexpected termination." });
+    if (terminal !== undefined) {
+      const expected = {
+        sequence: terminal.sequence,
+        source: terminal.source,
+        event: terminal.event,
+        ...("alias" in terminal ? { alias: terminal.alias } : {}),
+        ...("cause" in terminal ? { cause: terminal.cause } : {}),
+      };
+      if (JSON.stringify(diagnostic.earliestTermination) !== JSON.stringify(expected))
+        ctx.addIssue({ code: "custom", path: ["earliestTermination"], message: "Wrong termination." });
+    }
+  });
+
 export const EventTypeSchema = z.enum([
   "RunStarted",
   "EnvironmentAllocated",
@@ -253,6 +392,7 @@ export const ConfigSnapshotSchema = z
 
 export type ArtifactRef = z.infer<typeof ArtifactRefSchema>;
 export type ArtifactDescriptor = z.infer<typeof ArtifactDescriptorSchema>;
+export type ProviderLifecycleDiagnostic = z.infer<typeof ProviderLifecycleDiagnosticSchema>;
 type EventDataByType = {
   [K in keyof typeof EventDataSchemas]: z.infer<(typeof EventDataSchemas)[K]>;
 };

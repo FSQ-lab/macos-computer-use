@@ -86,8 +86,8 @@ describe("LocalEvidenceAdapter", () => {
     const evidence = new LocalEvidenceAdapter(join(root, "evidence"), join(root, "state"), 1000);
     const result = await evidence.commitArtifact({
       runId,
-      type: "test",
-      mimeType: "text/plain",
+      type: "hook-test-data",
+      mimeType: "application/octet-stream",
       sensitivity: "normal",
       bytes: new TextEncoder().encode("data"),
     });
@@ -140,8 +140,8 @@ describe("LocalEvidenceAdapter", () => {
     expect((await evidence.preflight(runId)).ok).toBe(true);
     const artifact = await evidence.commitArtifact({
       runId,
-      type: "test",
-      mimeType: "text/plain",
+      type: "hook-test-data",
+      mimeType: "application/octet-stream",
       sensitivity: "normal",
       bytes: new TextEncoder().encode("1234567890"),
     });
@@ -150,10 +150,34 @@ describe("LocalEvidenceAdapter", () => {
       (
         await evidence.commitArtifact({
           runId,
-          type: "test",
-          mimeType: "text/plain",
+          type: "hook-test-data",
+          mimeType: "application/octet-stream",
           sensitivity: "normal",
           bytes: new TextEncoder().encode("abcdefghijk"),
+        })
+      ).ok,
+    ).toBe(false);
+    expect(
+      (
+        await evidence.commitArtifact({
+          runId,
+          type: "innocent-note",
+          mimeType: "application/octet-stream",
+          sensitivity: "potentiallySensitive",
+          bytes: new TextEncoder().encode(
+            "[WD Proxy] Proxying [DELETE /session/raw-provider-id] to a downstream server",
+          ),
+        })
+      ).ok,
+    ).toBe(false);
+    expect(
+      (
+        await evidence.commitArtifact({
+          runId,
+          type: "innocent-note",
+          mimeType: "text/plain",
+          sensitivity: "normal",
+          bytes: new TextEncoder().encode("[Appium] Welcome to Appium v3.7.0"),
         })
       ).ok,
     ).toBe(false);
@@ -241,8 +265,8 @@ describe("LocalEvidenceAdapter", () => {
     );
     const committed = await evidence.commitArtifact({
       runId,
-      type: "test",
-      mimeType: "text/plain",
+      type: "hook-test-data",
+      mimeType: "application/octet-stream",
       sensitivity: "normal",
       bytes: new TextEncoder().encode("data"),
     });
@@ -272,8 +296,8 @@ describe("LocalEvidenceAdapter", () => {
         (
           await evidence.commitArtifact({
             runId,
-            type: "test",
-            mimeType: "text/plain",
+            type: "hook-test-data",
+            mimeType: "application/octet-stream",
             sensitivity: "normal",
             bytes: new TextEncoder().encode("data"),
           })
@@ -497,9 +521,34 @@ describe("LocalEvidenceAdapter", () => {
       type: "guest-diagnostics",
       mimeType: "application/json",
       sensitivity: "potentiallySensitive",
-      bytes: new TextEncoder().encode("{}"),
+      bytes: new TextEncoder().encode(
+        JSON.stringify({
+          schemaVersion: 1,
+          compatibility: { appium: "3.7.0", mac2: "4.3.5" },
+          events: [],
+          snapshot: {
+            capturedAt: "2026-01-01T00:00:00.000Z",
+            observedBeforeCleanup: true,
+            appiumStatus: "ready",
+            wdaStatus: "ready",
+            activeSessionCount: 1,
+            processes: { appium: true, xcodebuild: true, wda: true },
+          },
+        }),
+      ),
     });
     expect(diagnostics.ok && diagnostics.value.relativePath.startsWith("diagnostics/")).toBe(true);
+    expect(
+      (
+        await evidence.commitArtifact({
+          runId,
+          type: "guest-diagnostics",
+          mimeType: "application/json",
+          sensitivity: "potentiallySensitive",
+          bytes: new TextEncoder().encode(JSON.stringify({ schemaVersion: 1, requestBody: "secret" })),
+        })
+      ).ok,
+    ).toBe(false);
     expect(
       JSON.parse(await readFile(join(root, "evidence", "runs", runId, "environment.json"), "utf8")),
     ).toEqual(JSON.parse(new TextDecoder().decode(environment)));

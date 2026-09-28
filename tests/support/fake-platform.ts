@@ -36,9 +36,11 @@ export class FakePlatform implements ImagePort, VmPort, GuestPort, DesktopPort {
     this.imageRequest = request;
     return ok(fakeReceipt());
   }
-  async listManaged(signal?: AbortSignal) {
+  async listManaged(
+    signal?: AbortSignal,
+  ): Promise<ReturnType<VmPort["listManaged"]> extends Promise<infer T> ? T : never> {
     this.#ignore(signal);
-    return ok([]);
+    return ok([] as readonly string[]);
   }
   async clone(request: Parameters<VmPort["clone"]>[0], signal?: AbortSignal) {
     this.#ignore(signal);
@@ -112,7 +114,23 @@ export class FakePlatform implements ImagePort, VmPort, GuestPort, DesktopPort {
   }
   async exportDiagnostics(resourceId?: string, limits?: unknown, signal?: AbortSignal) {
     this.#ignore(resourceId, limits, signal);
-    return ok(new Uint8Array());
+    return ok(
+      new TextEncoder().encode(
+        JSON.stringify({
+          schemaVersion: 1,
+          compatibility: { appium: "3.7.0", mac2: "4.3.5" },
+          events: [],
+          snapshot: {
+            capturedAt: "2026-09-21T00:00:00.000Z",
+            observedBeforeCleanup: true,
+            appiumStatus: "ready",
+            wdaStatus: "ready",
+            activeSessionCount: 1,
+            processes: { appium: true, xcodebuild: true, wda: true },
+          },
+        }),
+      ),
+    );
   }
   async startSession(request: Parameters<DesktopPort["startSession"]>[0], signal?: AbortSignal) {
     this.#ignore(signal);
@@ -188,13 +206,15 @@ export class FakePlatform implements ImagePort, VmPort, GuestPort, DesktopPort {
           elementId: "element-00000001" as Observation["elements"][number]["elementId"],
           role: "button",
           name: "Save",
+          visible: true,
           enabled: true,
+          geometry: { x: 0, y: 0, width: 100, height: 40 },
         },
       ],
     };
     return ok({
       observation,
-      screenshot: new Uint8Array([1, 2, 3]),
+      screenshot: new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]),
       snapshot: new TextEncoder().encode("{}"),
     });
   }
@@ -206,6 +226,10 @@ export class FakePlatform implements ImagePort, VmPort, GuestPort, DesktopPort {
       status: assertion.kind === "visible" ? this.assertionStatus : ("unverifiable" as const),
       reason: "fake",
     });
+  }
+  preflightAssertion(_assertion: AssertionSpec, _observation: Observation) {
+    this.#ignore(_assertion, _observation);
+    return ok({ status: "admissible" as const, reason: "fake" });
   }
   compact(observation: Observation) {
     return `snapshot=${observation.observationId}`;

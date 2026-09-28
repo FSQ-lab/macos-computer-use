@@ -236,6 +236,10 @@ class FakePorts implements ImagePort, VmPort, GuestPort, EvidencePort, DesktopPo
     return cancelledError("driver");
   };
   evaluate = () => this.#fail("evaluate", "driver");
+  preflightAssertion = () => {
+    this.calls.push("preflightAssertion");
+    return cancelledError("driver");
+  };
   compact = () => {
     this.calls.push("compact");
     return "fake";
@@ -400,6 +404,7 @@ describe("shared semantic Port profile", () => {
       port.dispatch(action, "operation-00000001" as OperationId, cancelled.signal),
       port.rebind(action, observation),
       port.evaluate(assertion, observation, cancelled.signal),
+      port.preflightAssertion(assertion, observation),
       port.compact(observation),
       port.query(observation, { role: "button" }),
       port.queryPage?.(observation, { role: "button" }, 0, 10),
@@ -465,6 +470,7 @@ describe("shared semantic Port profile", () => {
       "dispatch",
       "rebind",
       "evaluate",
+      "preflightAssertion",
       "compact",
       "query",
       "queryPage",
@@ -477,7 +483,7 @@ describe("shared semantic Port profile", () => {
       guestMethods.length,
       evidenceMethods.length,
       desktopMethods.length,
-    ]).toEqual([1, 6, 6, 13, 10]);
+    ]).toEqual([1, 6, 6, 13, 11]);
 
     const cancelled = new AbortController();
     cancelled.abort(new Error("cancelled"));
@@ -556,7 +562,13 @@ describe("shared semantic Port profile", () => {
       evidence.recoverOrphans(runId, cancelled.signal),
       evidence.append(event, cancelled.signal),
       evidence.commitArtifact(
-        { runId, type: "test", mimeType: "text/plain", sensitivity: "normal", bytes: new Uint8Array() },
+        {
+          runId,
+          type: "hook-test-data",
+          mimeType: "application/octet-stream",
+          sensitivity: "normal",
+          bytes: new Uint8Array(),
+        },
         cancelled.signal,
       ),
       evidence.commitManifest(manifest, cancelled.signal),
